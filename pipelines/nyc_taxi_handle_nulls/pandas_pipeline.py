@@ -269,7 +269,7 @@ if __name__ == "__main__":
     
     data_size_configs = {
         '1%': all_files_sorted[:max(1, int(total_file_count * 0.01))],
-        '2%': all_files_sorted[:max(1, int(total_file_count * 0.02))],
+        #'2%': all_files_sorted[:max(1, int(total_file_count * 0.02))],
         # '30%': all_files_sorted[:max(1, int(total_file_count * 0.30))],
         # '100%': all_files_sorted,
     }

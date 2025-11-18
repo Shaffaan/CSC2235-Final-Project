@@ -10,42 +10,58 @@ import math
 import warnings
 from memory_profiler import memory_usage
 import json
+import numpy as np
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 sys.path.append(PROJECT_ROOT)
 
 from common.download_utils import get_year_month_list, download_taxi_data
 
-def calculate_and_save_stats(df, config):
+def calculate_and_save_stats(df: pl.DataFrame, config: dict):
     """
-    Calculates aggregate stats and saves them to a JSON file.
+    Saves NULL statistics before and after imputation (Polars version).
     """
-    print("  Calculating final statistics...")
-    
-    columns_to_check = [
-        "trip_duration_mins", "speed_mph", "is_weekend",
-        "fare_scaled", "dist_scaled", "speed_scaled"
-    ]
-    
-    aggs = [pl.count().alias("total_rows")]
-    for col in columns_to_check:
-        aggs.append(pl.col(col).sum().alias(f"{col}_sum"))
-        aggs.append(pl.col(col).mean().alias(f"{col}_avg"))
-        aggs.append(pl.col(col).min().alias(f"{col}_min"))
-        aggs.append(pl.col(col).max().alias(f"{col}_max"))
-        aggs.append(pl.col(col).is_null().sum().alias(f"{col}_nulls"))
 
-    stats_df = df.select(aggs)
-    
-    stats_list = stats_df.to_dicts() 
-    
-    config_name = config.get('name', 'unknown_config')
-    output_path = os.path.join(os.environ.get('SCRIPT_RESULTS_DIR'), f'stats_{config_name}.json')
-    
+    print("  Calculating NULL statistics...")
+
+    # Total rows (safe, avoids df.height shadowing issues)
+    total_rows = len(df)
+
+    # Nulls before imputation (fare_amount)
+    nulls_before = df.select(
+        pl.col("fare_amount").is_null().sum()
+    ).item()
+
+    # Nulls after imputation (fare_amount_imputed)
+    nulls_after = df.select(
+        pl.col("fare_amount_imputed").is_null().sum()
+    ).item()
+
+    # Count rows that were imputed
+    # equivalent to: (fare_amount is null) OR (fare_amount <= 0)
+    imputed_rows = df.select(
+        ((pl.col("fare_amount").is_null()) | (pl.col("fare_amount") <= 0)).sum()
+    ).item()
+
+    stats = {
+        "config_name": config.get("name"),
+        "total_rows": int(total_rows),
+        "nulls_before_imputation": int(nulls_before),
+        "percentage_of_nulls": (nulls_before / total_rows) * 100 if total_rows > 0 else 0,
+        "nulls_after_imputation": int(nulls_after),
+        "rows_imputed": int(imputed_rows),
+        "null_pct_requested": config.get("null_pct"),
+    }
+
+    output_path = os.path.join(
+        os.environ.get("SCRIPT_RESULTS_DIR"),
+        f"stats_nulls_{config.get('name', 'unknown')}.json"
+    )
+
     with open(output_path, 'w') as f:
-        json.dump(stats_list, f, indent=2)
-    
-    print(f"  Final stats saved to {output_path}")
+        json.dump(stats, f, indent=2)
+
+    print(f"  NULL stats saved to {output_path}")
     return df
 
 def connect_to_db(config):
@@ -108,23 +124,29 @@ def load_data(con, config):
     print(f"  Loaded and unified {count} rows from {len(data_files)} files.")
     return df_unified
 
-def inject_nulls(df, config):
+def inject_nulls(df: pl.DataFrame, config: dict) -> pl.DataFrame:
+    """
+    Inject NULLs into 'fare_amount' based on null_pct using Polars.
+    """
     null_pct = float(config.get("null_pct", 0)) / 100.0
+    target_col = "fare_amount"
+
     if null_pct <= 0:
         print("  Null injection skipped (0%).")
         return df
 
-    print(f"  Injecting {null_pct*100:.1f}% NULLs...")
+    print(f"  Injecting {null_pct*100:.1f}% NULLs into '{target_col}'...")
 
-    mask = np.random.rand(df.height()) < null_pct
 
+    mask = np.random.rand(len(df)) < null_pct
+
+    print("reached here2")
     df = df.with_columns(
         pl.when(pl.Series(mask))
-        .then(None)
-        .otherwise(pl.col("fare_amount"))
-        .alias("fare_amount")
+          .then(None)
+          .otherwise(pl.col(target_col))
+          .alias(target_col)
     )
-
     print("  Null injection complete.")
     return df
 
@@ -154,102 +176,6 @@ def handle_missing_values(df, config):
     print("  Imputation complete.")
     return df
 
-def feature_engineering(df, config):
-    """
-    Performs feature engineering using Polars expressions.
-    Accepts and returns an eager DataFrame.
-    """
-    print("  Engineering features...")
-
-    df_with_duration = df.with_columns(
-        (
-            (
-                pl.col("tpep_dropoff_datetime").str.to_datetime(strict=False) -
-                pl.col("tpep_pickup_datetime").str.to_datetime(strict=False)
-            )
-            .dt.total_seconds() / 60.0
-        ).alias("trip_duration_mins")
-    )
-
-    df_features = df_with_duration.with_columns(
-        pl.col("trip_duration_mins").fill_null(0).clip(lower_bound=0).alias("trip_duration_mins"),
-        
-        pl.col("tpep_pickup_datetime").str.to_datetime(strict=False)
-          .dt.weekday().is_in([6, 7]).cast(pl.Int32).fill_null(0)
-          .alias("is_weekend")
-    ).with_columns(
-        pl.when(pl.col("trip_duration_mins") > 0)
-          .then(pl.col("trip_distance_imputed") / (pl.col("trip_duration_mins") / 60.0))
-          .otherwise(0.0)
-          .fill_null(0.0)
-          .alias("speed_mph")
-    )
-    
-    print("  Engineered features: duration, speed, is_weekend.")
-    return df_features
-
-def categorical_encoding(df, config):
-    """
-    Performs one-hot encoding on the 'payment_type_imputed' column.
-    Accepts and returns an eager DataFrame.
-    """
-    payment_types = df.get_column("payment_type_imputed").unique(maintain_order=True).to_list()
-    print(f"  One-hot encoding for payment types: {payment_types}")
-    
-    select_clauses = []
-    for pt in payment_types:
-        pt_str = str(pt) 
-        pt_col_name = pt_str.replace('.', '_').replace('-', '_')
-        
-        clause = pl.when(pl.col("payment_type_imputed") == pt).then(1).otherwise(0).alias(f"payment_type_{pt_col_name}")
-        select_clauses.append(clause)
-        
-    if not select_clauses:
-        print("  No payment types found to encode. Skipping.")
-        return df
-        
-    df_encoded = df.with_columns(select_clauses)
-    print("  Performed one-hot encoding.")
-    return df_encoded
-
-def numerical_scaling(df, config):
-    """
-    Applies Min-Max scaling.
-    Accepts and returns an eager DataFrame.
-    """
-    params = df.select([
-        pl.col("fare_amount_imputed").min().alias("min_fare"),
-        pl.col("fare_amount_imputed").max().alias("max_fare"),
-        pl.col("trip_distance_imputed").min().alias("min_dist"),
-        pl.col("trip_distance_imputed").max().alias("max_dist"),
-        pl.col("speed_mph").min().alias("min_speed"),
-        pl.col("speed_mph").max().alias("max_speed"),
-    ]).row(0, named=True)
-
-    min_fare = params.get("min_fare", 0) or 0
-    max_fare = params.get("max_fare", 0) or 0
-    min_dist = params.get("min_dist", 0) or 0
-    max_dist = params.get("max_dist", 0) or 0
-    min_speed = params.get("min_speed", 0) or 0
-    max_speed = params.get("max_speed", 0) or 0
-
-    print(f"  Scaling params: Fare({min_fare}, {max_fare}), Dist({min_dist}, {max_dist}), Speed({min_speed}, {max_speed})")
-
-    def min_max_scaler(col_name, min_val, max_val):
-        denominator = max_val - min_val
-        if denominator == 0:
-            return pl.lit(0.0)
-        return (pl.col(col_name) - min_val) / denominator
-        
-    df_scaled = df.with_columns([
-        min_max_scaler("fare_amount_imputed", min_fare, max_fare).alias("fare_scaled"),
-        min_max_scaler("trip_distance_imputed", min_dist, max_dist).alias("dist_scaled"),
-        min_max_scaler("speed_mph", min_speed, max_speed).alias("speed_scaled")
-    ])
-    
-    print("  Applied Min-Max scaling.")
-    return df_scaled
-
 def run_full_pipeline(config, global_results_df):
     """
     Identical to the DuckDB harness.
@@ -264,6 +190,7 @@ def run_full_pipeline(config, global_results_df):
     pipeline_steps = [
         (connect_to_db, (config,), {}),
         (load_data, (None, config), {}),
+        (inject_nulls, (None, config), {}),
         (handle_missing_values, (None, config), {}),
         (calculate_and_save_stats, (None, config), {})
     ]
@@ -374,7 +301,8 @@ if __name__ == "__main__":
         '100%': {'threads': total_cores, 'memory': f"{int(safe_max_mem_gb)}GB"}
     }
 
-    null_configs = {"10%": 10, "20%": 20, "50%": 50, "99%": 99}
+    null_size_configs = {
+        "10%": 10, "20%": 20, "50%": 50,"99%": 99 }
 
     CONFIGURATIONS = []
     for data_pct, file_list in data_size_configs.items():

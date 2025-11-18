@@ -282,10 +282,7 @@ if __name__ == "__main__":
         '100%': {'threads': total_cores, 'memory': f"{int(safe_max_mem_gb)}GB"}
     }
     null_size_configs = {
-        "10%": 10,
-        "20%": 20,
-        "50%": 50,
-        "99%": 99 }
+        "10%": 10, "20%": 20, "50%": 50,"99%": 99 }
 
     CONFIGURATIONS = []
     for data_pct, file_list in data_size_configs.items():
@@ -304,7 +301,7 @@ if __name__ == "__main__":
     for config in CONFIGURATIONS:
         all_results_df = run_full_pipeline(config, all_results_df)
 
-    output_csv = os.path.join(RESULTS_DIR, 'duckdb_results_null.csv')
+    output_csv = os.path.join(RESULTS_DIR, 'duckdb_results.csv')
     all_results_df.to_csv(output_csv, index=False)
     
     print(f"\n--- DuckDB benchmarks complete ---")

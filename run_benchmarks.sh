@@ -132,6 +132,7 @@ echo "========================================================"
 echo "--- Generating Final Report ---"
 echo "========================================================"
 
-"$VENV_PYTHON" common/summarize_results.py "$RESULTS_DIR"
+#"$VENV_PYTHON" common/summarize_results.py "$RESULTS_DIR"
+"$VENV_PYTHON" common/generate_graph_for_nulls.py "$RESULTS_DIR"
 
 echo "--- All complete. Results are in $RESULTS_DIR ---"

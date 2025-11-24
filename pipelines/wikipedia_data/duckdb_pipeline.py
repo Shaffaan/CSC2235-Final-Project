@@ -232,15 +232,12 @@ def benchmark_joins(join_plans: List[JoinPlan], config: Dict[str, Any]) -> pd.Da
             step_label = f"{plan.name}:{join_type}"
             start = time.perf_counter()
 
-            # Execute the join
             result_rel = duckdb_con.sql(sql)
 
-            # Count rows without materializing full output
             result_count = result_rel.aggregate("count(*)").fetchone()[0]
 
             elapsed = time.perf_counter() - start
 
-            # Column count from DuckDB schema (no df needed)
             column_count = len(result_rel.columns)
 
             records.append(

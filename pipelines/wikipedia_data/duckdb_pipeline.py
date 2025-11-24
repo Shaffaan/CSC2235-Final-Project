@@ -250,8 +250,8 @@ def benchmark_joins(join_plans: List[JoinPlan], config: Dict[str, Any]) -> pd.Da
                     "right_table": plan.right_label,
                     "left_rows": int(left_rows),
                     "right_rows": int(right_rows),
-                    "result_rows": int(result_count),   # correct
-                    "columns_returned": column_count,   # no df needed
+                    "result_rows": int(result_count),
+                    "columns_returned": column_count,
                     "execution_time_s": elapsed,
                 }
             )

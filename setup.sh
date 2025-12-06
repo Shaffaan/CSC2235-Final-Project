@@ -16,10 +16,10 @@ echo "Found project user: $USER_NAME with home: $USER_HOME" >> /local/repository
 
 sudo -u "$USER_NAME" bash -c "
     echo 'Creating venv as $USER_NAME...' >> /local/repository/setup.log
-    python3 -m venv /local/repository/venv
+    python3 -m venv /local/repository/.venv
     
     echo 'Activating venv and installing requirements...' >> /local/repository/setup.log
-    source /local/repository/venv/bin/activate
+    source /local/repository/.venv/bin/activate
     pip install --upgrade pip
     pip install -r /local/repository/requirements.txt
 "

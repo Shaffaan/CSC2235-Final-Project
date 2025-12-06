@@ -31,7 +31,7 @@ RESULTS_DIR="results/$TIMESTAMP"
 mkdir -p "$RESULTS_DIR"
 echo "Results will be saved to: $RESULTS_DIR"
 
-VENV_PYTHON="/local/repository/venv/bin/python3"
+VENV_PYTHON="/local/repository/.venv/bin/python3"
 
 TARGET_PIPELINES=()
 if [ -z "$PIPELINE_NAME_ARG" ]; then

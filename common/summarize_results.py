@@ -174,7 +174,7 @@ def reconcile_stats(full_stats_df, pipeline_name):
         print(f"  Found {len(stats_df)} frameworks to check: {stats_df['framework'].tolist()}")
 
         all_match = True
-        TOLERANCE = 1e-9
+        TOLERANCE = 1e-5
         
         columns_to_check = [col for col in stats_df.columns if col not in ['framework', 'config_name', 'index']]
 

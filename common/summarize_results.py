@@ -7,6 +7,7 @@ import glob
 import numpy as np
 import json
 
+PREFERRED_FRAMEWORK_ORDER = ['duckdb', 'polars', 'pandas', 'spark']
 
 def visualize_config_comparison(results_df, output_file):
     """
@@ -110,10 +111,10 @@ def visualize_framework_comparison(all_results_df, output_dir):
                     color="step",
                     orientation='h',
                     title=title,
-                    hover_data=['execution_time_s', 'peak_memory_mib', 'cpu_time_s', 'start_time', 'end_time']
+                    hover_data=['execution_time_s', 'peak_memory_mib', 'cpu_time_s', 'start_time', 'end_time'],
+                    category_orders={'framework': PREFERRED_FRAMEWORK_ORDER}
                 )
-                
-                fig_time.update_yaxes(autorange="reversed")
+
                 fig_time.update_layout(
                     xaxis_title="Time (seconds)",
                     yaxis_title="Framework",
@@ -139,7 +140,8 @@ def visualize_framework_comparison(all_results_df, output_dir):
                     x='framework',
                     y='peak_memory_mib',
                     color='framework',
-                    title=title
+                    title=title,
+                    category_orders={'framework': PREFERRED_FRAMEWORK_ORDER}
                 )
                 fig_mem.write_html(os.path.join(output_dir, filename))
         except Exception as e:

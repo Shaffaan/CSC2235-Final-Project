@@ -19,7 +19,7 @@ SPARK_VERSION="3.5.0"
 SPARK_DIR="/opt/spark"
 if [ ! -d "$SPARK_DIR" ]; then
     echo "Installing Spark Binaries to $SPARK_DIR..." >> /local/repository/setup.log
-    wget -q https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.tgz
+    wget https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.tgz
     sudo tar xf spark-${SPARK_VERSION}-bin-hadoop3.tgz -C /opt/
     sudo mv /opt/spark-${SPARK_VERSION}-bin-hadoop3 $SPARK_DIR
     sudo chown -R "$USER_NAME" "$SPARK_DIR"

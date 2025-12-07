@@ -41,10 +41,26 @@ if [ "$IS_DISTRIBUTED" = true ]; then
     fi
     echo "--- Detected Distributed Cluster (5 Nodes) ---"
     
+    echo "--- Setting up Passwordless SSH for Cluster ---"
+    USER_NAME=$(whoami)
+    
+    if [ ! -f "$HOME/.ssh/id_rsa" ]; then
+        echo "Generating SSH key for $USER_NAME..."
+        ssh-keygen -t rsa -N "" -f "$HOME/.ssh/id_rsa"
+    fi
+
+    for i in {1..4}; do
+        WORKER_NODE="node-$i"
+        echo "Propagating public key to $WORKER_NODE..."
+        
+        cat "$HOME/.ssh/id_rsa.pub" | sudo ssh -o StrictHostKeyChecking=no "$WORKER_NODE" \
+            "mkdir -p /users/$USER_NAME/.ssh && cat >> /users/$USER_NAME/.ssh/authorized_keys"
+    done
+    
     # 1. Start Spark Master on Node 0
     echo "Starting Spark Master on node-0..."
     $SPARK_HOME/sbin/stop-master.sh
-    $SPARK_HOME/sbin/start-master.sh
+    SPARK_MASTER_HOST=0.0.0.0 $SPARK_HOME/sbin/start-master.sh
     
     # Wait a moment for master to bind
     sleep 3

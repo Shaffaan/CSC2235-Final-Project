@@ -7,7 +7,7 @@ import glob
 import numpy as np
 import json
 
-PREFERRED_FRAMEWORK_ORDER = ['duckdb', 'polars', 'pandas', 'spark']
+PREFERRED_FRAMEWORK_ORDER = ['duckdb', 'polars', 'pandas', 'spark_local', 'spark_distributed']
 
 def visualize_config_comparison(results_df, output_file):
     """

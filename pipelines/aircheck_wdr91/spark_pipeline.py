@@ -43,20 +43,19 @@ def connect_to_db(config):
     mem = config.get('memory_limit', '8g')
     if "GB" in mem: mem = mem.replace("GB", "g")
     
-    # Check for distributed master provided by run_benchmarks.sh
+    spark_mode = os.environ.get("SPARK_MODE", "local")
     master_url = os.environ.get("SPARK_MASTER_URL")
     
-    builder = SparkSession.builder.appName("Aircheck_Benchmark")
+    builder = SparkSession.builder.appName(f"Aircheck_Benchmark_{spark_mode}")
     
-    if master_url:
+    if spark_mode == "distributed" and master_url:
         print(f"  [Distributed] Connecting to Master: {master_url}")
         builder = builder.master(master_url)
-        # In distributed mode, 'memory_limit' applies to the executor
         builder = builder.config("spark.executor.memory", mem)
-        builder = builder.config("spark.driver.memory", "4g") # Driver on node-0 needs less
-        builder = builder.config("spark.cores.max", int(config.get('num_threads', 12)) * 5) # Utilizing cluster cores
+        builder = builder.config("spark.driver.memory", "4g")
+        builder = builder.config("spark.cores.max", int(config.get('num_threads', 12)) * 5)
     else:
-        print(f"  [Local] Connecting to local[*]")
+        print(f"  [Local] Connecting to local[{config.get('num_threads', '*')}]")
         builder = builder.master(f"local[{config.get('num_threads', '*')}]")
         builder = builder.config("spark.driver.memory", mem)
 
@@ -70,12 +69,6 @@ def load_data(con, config):
     spark = con
     print(f"  Defining DataFrame (Parquet Read)...")
     cols = ['ALOGP', 'MW', 'NTC_VALUE', 'TARGET_VALUE', 'LABEL', 'BB1_ID', 'BB2_ID', 'TARGET_ID']
-    
-    # NOTE: In distributed mode with local files, we provide the absolute path.
-    # Since setup.sh runs on all nodes, this path exists on all nodes.
-    # Spark workers will read their local blocks if structured correctly, 
-    # or fail if they can't see the file. 
-    # For a 'fair' benchmark mimicking HDFS without HDFS, we assume the path is valid everywhere.
     
     files = [f"file://{os.path.abspath(f)}" for f in config['data_files']]
     
@@ -103,8 +96,8 @@ def feature_engineering(df, config):
           .otherwise(F.col("enrichment_score")))
 
     df = df.withColumn("log_mw", F.log(F.col("MW") + 1.0)) \
-           .withColumn("is_high_mw", F.when(F.col("MW") > 500, 1).otherwise(0))
-           
+            .withColumn("is_high_mw", F.when(F.col("MW") > 500, 1).otherwise(0))
+            
     return df
 
 def categorical_encoding(df, config):
@@ -137,9 +130,9 @@ def numerical_scaling(df, config):
         return (F.col(col) - min_v) / (max_v - min_v)
         
     df = df.withColumn("mw_scaled", scaler("MW", stats['min_mw'], stats['max_mw'])) \
-           .withColumn("alogp_scaled", scaler("ALOGP", stats['min_alogp'], stats['max_alogp'])) \
-           .withColumn("enrichment_scaled", scaler("enrichment_score", stats['min_en'], stats['max_en']))
-           
+            .withColumn("alogp_scaled", scaler("ALOGP", stats['min_alogp'], stats['max_alogp'])) \
+            .withColumn("enrichment_scaled", scaler("enrichment_score", stats['min_en'], stats['max_en']))
+            
     return df
 
 def run_full_pipeline(config, global_results_df):
@@ -174,9 +167,6 @@ def run_full_pipeline(config, global_results_df):
             cpu_before = process.cpu_times()
             start = time.perf_counter()
             
-            # Note: memory_profiler in distributed mode only measures the Driver.
-            # Distributed metrics require Spark Listener, but for this benchmark harness 
-            # we accept driver metrics as a proxy for "Orchestration Cost".
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 mem_usage = memory_usage((func, current_args, kwargs), max_usage=True, retval=True, interval=0.1)
@@ -209,13 +199,13 @@ def run_full_pipeline(config, global_results_df):
     return pd.concat([global_results_df, pd.DataFrame(run_results_list)], ignore_index=True)
 
 if __name__ == "__main__":
+    SPARK_MODE = os.environ.get("SPARK_MODE", "local")
     RESULTS_DIR = os.environ.get('SCRIPT_RESULTS_DIR') 
     if not RESULTS_DIR:
-        RESULTS_DIR = "results/local_test/aircheck/spark"
+        RESULTS_DIR = f"results/local_test/aircheck/spark_{SPARK_MODE}"
         os.makedirs(RESULTS_DIR, exist_ok=True)
 
     LOCAL_DATA_DIR = os.path.join(PROJECT_ROOT, "data", "aircheck_wdr91")
-    # In distributed mode, this checks LOCAL node for file existence.
     all_files = download_aircheck_data(LOCAL_DATA_DIR)
     
     if not all_files: sys.exit(1)
@@ -228,10 +218,6 @@ if __name__ == "__main__":
     except Exception:
         print("Could not detect system info.")
     
-    # Configuration Logic
-    # If running distributed, we might want higher resource caps or different config names.
-    # For now, we keep the same logic but the run_pipeline function adapts the Spark Conf.
-    
     data_size_configs = {
         '100%': all_files,
     }
@@ -243,6 +229,7 @@ if __name__ == "__main__":
     for data_pct, file_list in data_size_configs.items():
         for sys_pct, sys_config in system_size_configs.items():
             config_name = f"Data_{data_pct}_Sys_{sys_pct}"
+            
             CONFIGURATIONS.append({
                 "name": config_name,
                 "file_type": "parquet",
@@ -255,5 +242,5 @@ if __name__ == "__main__":
     for config in CONFIGURATIONS:
         all_results_df = run_full_pipeline(config, all_results_df)
 
-    output_csv = os.path.join(RESULTS_DIR, 'spark_results.csv')
+    output_csv = os.path.join(RESULTS_DIR, f'spark_{SPARK_MODE}_results.csv')
     all_results_df.to_csv(output_csv, index=False)

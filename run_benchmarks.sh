@@ -1,10 +1,6 @@
 #!/bin/bash
 
 # --- Fair Benchmarking Harness (Distributed Capable) ---
-#
-# USAGE:
-#   ./run_benchmarks.sh                         (Runs all pipelines)
-#   ./run_benchmarks.sh <pipeline> <framework>  (Runs specific config)
 
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 export SPARK_HOME=/opt/spark
@@ -20,16 +16,12 @@ RESULTS_DIR="results/$TIMESTAMP"
 mkdir -p "$RESULTS_DIR"
 
 VENV_PYTHON="/local/repository/.venv/bin/python3"
-export PYTHONPATH=$SCRIPT_DIR
 
 # --- Cluster Discovery ---
-# We assume hostnames node-0, node-1, etc. based on Profile.
-# 'node-0' is the master.
 HOSTNAME=$(hostname)
 IS_DISTRIBUTED=false
 MASTER_URL=""
 
-# Check if node-1 exists in /etc/hosts to determine if we are in a cluster
 if grep -q "node-1" /etc/hosts; then
     IS_DISTRIBUTED=true
 fi
@@ -62,28 +54,21 @@ if [ "$IS_DISTRIBUTED" = true ]; then
     $SPARK_HOME/sbin/stop-master.sh
     SPARK_MASTER_HOST=0.0.0.0 $SPARK_HOME/sbin/start-master.sh
     
-    # Wait a moment for master to bind
     sleep 3
     MASTER_URL="spark://node-0:7077"
     export SPARK_MASTER_URL="$MASTER_URL"
     
-    # 2. Start Spark Workers on Node 1, 2, 3, 4
-    # We assume passwordless SSH is set up by CloudLab/Emulab automatically.
     for i in {1..4}; do
         WORKER_HOST="node-$i"
         echo "Starting Spark Worker on $WORKER_HOST..."
-        # Stop existing worker just in case, then start new one pointing to master
         ssh $WORKER_HOST "$SPARK_HOME/sbin/stop-worker.sh; nohup $SPARK_HOME/sbin/start-worker.sh $MASTER_URL > /dev/null 2>&1 &"
     done
     
-    # Give workers time to register
     echo "Waiting for workers to register..."
     sleep 10
     
-    # Ensure PySpark uses the venv on workers
     export PYSPARK_PYTHON="$VENV_PYTHON"
     export PYSPARK_DRIVER_PYTHON="$VENV_PYTHON"
-
 else
     echo "--- Detected Single Node Setup ---"
 fi
@@ -117,27 +102,49 @@ for PIPELINE_NAME in "${TARGET_PIPELINES[@]}"; do
     fi
 
     for script in "${TARGET_SCRIPTS[@]}"; do
-        FRAMEWORK=$(basename "$script" _pipeline.py)
+        BASE_FRAMEWORK=$(basename "$script" _pipeline.py)
         
-        FRAMEWORK_RESULTS_DIR="$RESULTS_PIPELINE_DIR/$FRAMEWORK"
-        mkdir -p "$FRAMEWORK_RESULTS_DIR"
-
-        echo "Running: $script"
+        MODES=("standard")
         
-        # Clear Cache on ALL nodes if distributed
-        if [ "$IS_DISTRIBUTED" = true ]; then
-            echo "Clearing cache on cluster..."
-            sudo sync; sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"
-            for i in {1..4}; do
-                ssh node-$i "sudo sync; sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'"
-            done
-        else
-            sudo sync; sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"
+        if [ "$BASE_FRAMEWORK" == "spark" ]; then
+            if [ "$IS_DISTRIBUTED" = true ]; then
+                MODES=("local" "distributed")
+            else
+                MODES=("local")
+            fi
         fi
 
-        export SCRIPT_RESULTS_DIR="$FRAMEWORK_RESULTS_DIR"
-        "$VENV_PYTHON" "$script"
-        unset SCRIPT_RESULTS_DIR
+        for mode in "${MODES[@]}"; do
+            
+            if [ "$BASE_FRAMEWORK" == "spark" ]; then
+                FRAMEWORK_LABEL="spark_${mode}"
+            else
+                FRAMEWORK_LABEL="$BASE_FRAMEWORK"
+            fi
+            
+            FRAMEWORK_RESULTS_DIR="$RESULTS_PIPELINE_DIR/$FRAMEWORK_LABEL"
+            mkdir -p "$FRAMEWORK_RESULTS_DIR"
+
+            echo "Running: $script (Mode: $mode)"
+            
+            if [ "$IS_DISTRIBUTED" = true ]; then
+                echo "Clearing cache on cluster..."
+                sudo sync; sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"
+                for i in {1..4}; do
+                    ssh node-$i "sudo sync; sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'"
+                done
+            else
+                sudo sync; sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"
+            fi
+
+            export SCRIPT_RESULTS_DIR="$FRAMEWORK_RESULTS_DIR"
+            export SPARK_MODE="$mode" 
+
+            "$VENV_PYTHON" "$script"
+            
+            unset SCRIPT_RESULTS_DIR
+            unset SPARK_MODE
+        done
     done
 done
 

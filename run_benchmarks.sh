@@ -61,7 +61,7 @@ if [ "$IS_DISTRIBUTED" = true ]; then
     for i in {1..4}; do
         WORKER_HOST="node-$i"
         echo "Starting Spark Worker on $WORKER_HOST..."
-        ssh $WORKER_HOST "$SPARK_HOME/sbin/stop-worker.sh; nohup $SPARK_HOME/sbin/start-worker.sh $MASTER_URL > /dev/null 2>&1 &"
+        ssh -o StrictHostKeyChecking=no $WORKER_HOST "$SPARK_HOME/sbin/stop-worker.sh; nohup $SPARK_HOME/sbin/start-worker.sh $MASTER_URL > /dev/null 2>&1 &"
     done
     
     echo "Waiting for workers to register..."
@@ -131,7 +131,7 @@ for PIPELINE_NAME in "${TARGET_PIPELINES[@]}"; do
                 echo "Clearing cache on cluster..."
                 sudo sync; sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"
                 for i in {1..4}; do
-                    ssh node-$i "sudo sync; sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'"
+                    ssh -o StrictHostKeyChecking=no node-$i "sudo sync; sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'"
                 done
             else
                 sudo sync; sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"
@@ -153,7 +153,7 @@ if [ "$IS_DISTRIBUTED" = true ]; then
     echo "--- Tearing down Spark Cluster ---"
     $SPARK_HOME/sbin/stop-master.sh
     for i in {1..4}; do
-        ssh node-$i "$SPARK_HOME/sbin/stop-worker.sh"
+        ssh -o StrictHostKeyChecking=no node-$i "$SPARK_HOME/sbin/stop-worker.sh"
     done
 fi
 

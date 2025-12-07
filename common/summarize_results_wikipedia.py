@@ -1,18 +1,39 @@
 import glob
 import os
 import sys
-from typing import Dict, List
+from typing import Dict, List, Sequence, Tuple
 
 import pandas as pd
 import plotly.express as px
 import plotly.io as pio
 
 
-FRAMEWORK_DIRS = {
-    "pandas": "pandas",
-    "polars": "polars",
-    "duckdb": "duckdb",
+STATIC_FRAMEWORKS: Dict[str, Tuple[str, str]] = {
+    "pandas": ("pandas", "join_metrics_*.csv"),
+    "polars": ("polars", "join_metrics_*.csv"),
+    "duckdb": ("duckdb", "join_metrics_*.csv"),
 }
+SPARK_PATTERN = "spark_join_metrics_*.csv"
+
+
+def _iter_framework_sources(results_root: str) -> Sequence[Tuple[str, str, str]]:
+    """
+    Generates (framework_label, framework_dir, glob_pattern) tuples for summary discovery.
+    """
+    sources: List[Tuple[str, str, str]] = []
+
+    for label, (subdir, pattern) in STATIC_FRAMEWORKS.items():
+        sources.append((label, os.path.join(results_root, subdir), pattern))
+
+    for entry in sorted(os.listdir(results_root)):
+        if not entry.startswith("spark"):
+            continue
+        framework_dir = os.path.join(results_root, entry)
+        if not os.path.isdir(framework_dir):
+            continue
+        sources.append((entry, framework_dir, SPARK_PATTERN))
+
+    return sources
 
 
 def _load_join_metrics(results_root: str) -> pd.DataFrame:
@@ -21,10 +42,9 @@ def _load_join_metrics(results_root: str) -> pd.DataFrame:
     """
     frames: List[pd.DataFrame] = []
 
-    for framework, subdir in FRAMEWORK_DIRS.items():
-        framework_dir = os.path.join(results_root, subdir)
-        pattern = os.path.join(framework_dir, "join_metrics_*.csv")
-        csv_files = glob.glob(pattern)
+    for framework, framework_dir, pattern in _iter_framework_sources(results_root):
+        glob_pattern = os.path.join(framework_dir, pattern)
+        csv_files = glob.glob(glob_pattern)
 
         if not csv_files:
             print(f"[summarize] No join metrics found for {framework} under {framework_dir}")

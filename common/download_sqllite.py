@@ -21,3 +21,4 @@ def ensure_sqlite_dataset(download_dir: str) -> str:
 
     print(f"Dataset downloaded to: {path}")
     return path
+

@@ -4,6 +4,8 @@ import urllib.parse
 import json
 import time
 
+from common.download_sqllite import ensure_sqlite_dataset
+
 def get_year_month_list(start_year, start_month, end_year, end_month):
     """
     Generates a list of (year, month) tuples within the specified range.
@@ -106,3 +108,8 @@ if __name__ == "__main__":
     taxi_dir = os.path.join(base_path, "data", "nyc_taxi")
     ym_list = get_year_month_list(2009, 1, 2024, 12)
     download_taxi_data(ym_list, taxi_dir)
+
+    # 3. Download Kaggle Wikipedia SQLite dataset
+    wiki_dir = os.path.join(base_path, "data", "sqlite_datasets")
+    os.makedirs(wiki_dir, exist_ok=True)
+    ensure_sqlite_dataset(wiki_dir)

@@ -7,5 +7,5 @@ duckdb==1.4.1
 polars==1.35.2
 pandas==2.3.3
 pyspark==3.5.0
-kaggle-hub==0.3.4
+kagglehub==0.3.4
 setuptools>=70.0.0

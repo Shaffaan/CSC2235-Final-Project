@@ -95,9 +95,14 @@ def download_aircheck_data(local_dir="data/aircheck_wdr91"):
         return []
 
 if __name__ == "__main__":
-    print("--- Executing automated data download ---")
+    print("--- Executing automated data download (Setup Phase) ---")
     base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     
-    # Download Aircheck
+    # 1. Download Aircheck
     ac_dir = os.path.join(base_path, "data", "aircheck_wdr91")
     download_aircheck_data(ac_dir)
+
+    # 2. Download NYC Taxi
+    taxi_dir = os.path.join(base_path, "data", "nyc_taxi")
+    ym_list = get_year_month_list(2009, 1, 2024, 12)
+    download_taxi_data(ym_list, taxi_dir)

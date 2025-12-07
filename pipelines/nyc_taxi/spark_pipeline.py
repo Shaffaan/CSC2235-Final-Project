@@ -20,9 +20,6 @@ sys.path.append(PROJECT_ROOT)
 from common.download_utils import get_year_month_list, download_taxi_data
 
 def calculate_and_save_stats(df, config):
-    """
-    Calculates aggregate stats and saves them to a JSON file.
-    """
     print("  Calculating final statistics...")
     
     columns_to_check = [
@@ -51,41 +48,43 @@ def calculate_and_save_stats(df, config):
 
 def connect_to_db(config):
     """
-    Initializes and returns a SparkSession.
-    This acts as the 'connection' for the benchmark harness.
+    Initializes SparkSession. Support Local and Distributed modes.
     """
-    num_threads = config.get('num_threads', '*')
-    memory_limit = config.get('memory_limit', '8g')
+    mem = config.get('memory_limit', '8g')
+    if "GB" in mem: mem = mem.replace("GB", "g")
     
-    if isinstance(memory_limit, (int, float)):
-        memory_limit = f"{int(memory_limit)}g"
-    elif "GB" in memory_limit:
-        memory_limit = memory_limit.replace("GB", "g")
-        
-    conf = SparkConf() \
-        .setMaster(f"local[{num_threads}]") \
-        .setAppName("NYC_Taxi_Benchmark") \
-        .set("spark.driver.memory", memory_limit) \
-        .set("spark.sql.parquet.mergeSchema", "true")
-        
-    session = SparkSession.builder.config(conf=conf).getOrCreate()
+    spark_mode = os.environ.get("SPARK_MODE", "local")
+    master_url = os.environ.get("SPARK_MASTER_URL")
     
-    print(f"  Connected to Spark. Master: local[{num_threads}], Driver Memory: {memory_limit}")
+    builder = SparkSession.builder.appName(f"NYC_Taxi_Benchmark_{spark_mode}")
+    
+    if spark_mode == "distributed" and master_url:
+        print(f"  [Distributed] Connecting to Master: {master_url}")
+        builder = builder.master(master_url)
+        builder = builder.config("spark.executor.memory", mem)
+        builder = builder.config("spark.driver.memory", "4g")
+        builder = builder.config("spark.cores.max", int(config.get('num_threads', 12)) * 5)
+    else:
+        print(f"  [Local] Connecting to local[{config.get('num_threads', '*')}]")
+        builder = builder.master(f"local[{config.get('num_threads', '*')}]")
+        builder = builder.config("spark.driver.memory", mem)
+
+    builder = builder.config("spark.sql.parquet.mergeSchema", "true")
+    
+    session = builder.getOrCreate()
+    session.sparkContext.setLogLevel("ERROR")
     return session
 
 def load_data(con, config):
-    """
-    Loads data using SparkSession 'con'.
-    'con' is the SparkSession.
-    Returns an eager (cached) Spark DataFrame.
-    """
     spark = con
     data_files = config['data_files']
     if not data_files:
         raise ValueError("No data files specified in config['data_files']")
     print(f"  Loading and unifying schema for {len(data_files)} files...")
 
-    df = spark.read.parquet(*data_files)
+    files = [f"file://{os.path.abspath(f)}" for f in data_files]
+
+    df = spark.read.parquet(*files)
 
     existing_cols = set(df.columns)
 
@@ -117,125 +116,88 @@ def load_data(con, config):
     df_unified = df_unified.cache()
     count = df_unified.count()
 
-    print(f"  Loaded and unified {count} rows from {len(data_files)} files.")
+    print(f"  Loaded and unified {count} rows.")
     return df_unified
 
 
 def handle_missing_values(df, config):
-    """
-    Accepts an eager Spark DataFrame 'df'
-    and returns a new eager (cached) DataFrame.
-    """
     print("  Imputing missing values...")
     
-    mean_fare = df.filter(F.col("fare_amount") > 0).select(F.avg("fare_amount")).first()[0]
-    mean_fare = mean_fare or 0.0
-    
-    mean_distance = df.filter(F.col("trip_distance") > 0).select(F.avg("trip_distance")).first()[0]
-    mean_distance = mean_distance or 0.0
+    mean_fare = df.filter(F.col("fare_amount") > 0).select(F.avg("fare_amount")).first()[0] or 0.0
+    mean_distance = df.filter(F.col("trip_distance") > 0).select(F.avg("trip_distance")).first()[0] or 0.0
 
-    fare_cond = (F.col("fare_amount").isNull()) | (F.col("fare_amount") <= 0)
-    fare_expr = F.when(fare_cond, F.lit(mean_fare)).otherwise(F.col("fare_amount"))
+    df_clean = df.withColumn(
+        "fare_amount_imputed", 
+        F.when((F.col("fare_amount").isNull()) | (F.col("fare_amount") <= 0), F.lit(mean_fare))
+         .otherwise(F.col("fare_amount"))
+    ).withColumn(
+        "trip_distance_imputed",
+        F.when((F.col("trip_distance").isNull()) | (F.col("trip_distance") <= 0), F.lit(mean_distance))
+         .otherwise(F.col("trip_distance"))
+    ).withColumn(
+        "payment_type_imputed",
+        F.expr("COALESCE(TRY_CAST(payment_type AS INTEGER), 0)")
+    )
     
-    dist_cond = (F.col("trip_distance").isNull()) | (F.col("trip_distance") <= 0)
-    dist_expr = F.when(dist_cond, F.lit(mean_distance)).otherwise(F.col("trip_distance"))
-
-    payment_expr = F.expr("COALESCE(TRY_CAST(payment_type AS INTEGER), 0)")
-
-    df_clean = df.withColumn("fare_amount_imputed", fare_expr) \
-                 .withColumn("trip_distance_imputed", dist_expr) \
-                 .withColumn("payment_type_imputed", payment_expr)
-    
-    df_clean = df_clean.cache()
-    df_clean.count()
-    
-    print("  Imputed missing values.")
     return df_clean
 
 def feature_engineering(df, config):
-    """
-    Performs feature engineering using Spark functions.
-    Accepts and returns an eager (cached) DataFrame.
-    """
     print("  Engineering features...")
 
     pickup_ts = F.to_timestamp(F.col("tpep_pickup_datetime"))
     dropoff_ts = F.to_timestamp(F.col("tpep_dropoff_datetime"))
-    duration_secs = dropoff_ts.cast("long") - pickup_ts.cast("long")
-    duration_mins_expr = duration_secs / 60.0
     
-    is_weekend_expr = F.dayofweek(pickup_ts).isin([1, 7]).cast("integer")
-
-    df_features = df.withColumn("trip_duration_mins", duration_mins_expr) \
-                    .withColumn("is_weekend", is_weekend_expr)
+    df_features = df.withColumn(
+        "trip_duration_mins", 
+        (dropoff_ts.cast("long") - pickup_ts.cast("long")) / 60.0
+    ).withColumn(
+        "is_weekend",
+        F.dayofweek(pickup_ts).isin([1, 7]).cast("integer")
+    )
 
     df_features = df_features.withColumn(
         "trip_duration_mins",
-        F.when(
-            F.col("trip_duration_mins").isNull() | (F.col("trip_duration_mins") < 0),
-            F.lit(0.0)
-        ).otherwise(F.col("trip_duration_mins"))
+        F.when((F.col("trip_duration_mins").isNull()) | (F.col("trip_duration_mins") < 0), 0.0)
+         .otherwise(F.col("trip_duration_mins"))
     ).withColumn(
         "is_weekend",
-        F.when(F.col("is_weekend").isNull(), F.lit(0)).otherwise(F.col("is_weekend"))
+        F.coalesce(F.col("is_weekend"), F.lit(0))
     )
-    
-    speed_expr = F.when(
-        F.col("trip_duration_mins") > 0,
-        F.col("trip_distance_imputed") / (F.col("trip_duration_mins") / 60.0)
-    ).otherwise(F.lit(0.0))
-
-    df_features = df_features.withColumn("speed_mph", speed_expr)
     
     df_features = df_features.withColumn(
         "speed_mph",
-        F.when(
-            F.col("speed_mph").isNull() | 
-            F.isnan(F.col("speed_mph")) | 
-            (F.col("speed_mph") == F.lit(float('inf'))) | 
-            (F.col("speed_mph") == F.lit(float('-inf'))),
-            F.lit(0.0)
-        ).otherwise(F.col("speed_mph"))
+        F.when(F.col("trip_duration_mins") > 0, 
+               F.col("trip_distance_imputed") / (F.col("trip_duration_mins") / 60.0))
+         .otherwise(0.0)
     )
     
-    df_features = df_features.cache()
-    df_features.count()
-
-    print("  Engineered features: duration, speed, is_weekend.")
+    # Clean infinities
+    df_features = df_features.withColumn(
+        "speed_mph",
+        F.when(F.isnan(F.col("speed_mph")) | F.col("speed_mph").isin(float('inf'), float('-inf')), 0.0)
+         .otherwise(F.col("speed_mph"))
+    )
+    
     return df_features
 
 def categorical_encoding(df, config):
-    """
-    Performs one-hot encoding on the 'payment_type_imputed' column.
-    Accepts and returns an eager (cached) DataFrame.
-    """
     payment_types = [r[0] for r in df.select("payment_type_imputed").distinct().collect()]
     print(f"  One-hot encoding for payment types: {payment_types}")
     
     select_clauses = []
     for pt in payment_types:
         pt_str = str(pt).replace('.', '_').replace('-', '_')
-        
         clause = F.when(F.col("payment_type_imputed") == pt, 1).otherwise(0).alias(f"payment_type_{pt_str}")
         select_clauses.append(clause)
         
     if not select_clauses:
-        print("  No payment types found to encode. Skipping.")
         return df
     
     df_encoded = df.select("*", *select_clauses)
-    
-    df_encoded = df_encoded.cache()
-    df_encoded.count()
-
-    print("  Performed one-hot encoding.")
     return df_encoded
 
 def numerical_scaling(df, config):
-    """
-    Applies Min-Max scaling.
-    Accepts and returns an eager (cached) DataFrame.
-    """
+    print("  [INTERMEDIATE] Aggregating Min/Max for Scaling...")
     params = df.agg(
         F.min("fare_amount_imputed").alias("min_fare"),
         F.max("fare_amount_imputed").alias("max_fare"),
@@ -256,35 +218,17 @@ def numerical_scaling(df, config):
 
     def min_max_scaler(col_name, min_val, max_val):
         denominator = max_val - min_val
-        if denominator == 0:
-            return F.lit(0.0)
+        if denominator == 0: return F.lit(0.0)
         return (F.col(col_name) - min_val) / denominator
         
-    df_scaled = df.withColumn(
-        "fare_scaled", 
-        min_max_scaler("fare_amount_imputed", min_fare, max_fare)
-    ).withColumn(
-        "dist_scaled", 
-        min_max_scaler("trip_distance_imputed", min_dist, max_dist)
-    ).withColumn(
-        "speed_scaled", 
-        min_max_scaler("speed_mph", min_speed, max_speed)
-    )
-    
-    df_scaled = df_scaled.cache()
-    df_scaled.count()
-    
-    print("  Applied Min-Max scaling.")
+    df_scaled = df.withColumn("fare_scaled", min_max_scaler("fare_amount_imputed", min_fare, max_fare)) \
+                  .withColumn("dist_scaled", min_max_scaler("trip_distance_imputed", min_dist, max_dist)) \
+                  .withColumn("speed_scaled", min_max_scaler("speed_mph", min_speed, max_speed))
+                  
     return df_scaled
 
 def run_full_pipeline(config, global_results_df):
-    """
-    Modified harness to run Spark pipeline.
-    It passes the SparkSession to the first step,
-    then passes the resulting DataFrame to subsequent steps.
-    It also properly stops the SparkSession in the 'finally' block.
-    """
-    print(f"\n[BEGIN] Running pipeline: {config['name']}...")
+    print(f"\n[BEGIN] Running pipeline: {config['name']} (Spark Optimized)...")
     run_results_list = []
     pipeline_start_time = time.perf_counter()
     
@@ -309,14 +253,10 @@ def run_full_pipeline(config, global_results_df):
             if i == 0: 
                 current_args = (config,)
             elif i == 1: 
-                if spark_session is None:
-                    print("  SparkSession is missing. Stopping pipeline.")
-                    break
+                if spark_session is None: break
                 current_args = (spark_session, config)
             else: 
-                if df is None:
-                    print("  DataFrame is missing. Stopping pipeline.")
-                    break
+                if df is None: break
                 current_args = (df, config)
                 
             print(f"  [START] Step: {step_name}")
@@ -325,8 +265,7 @@ def run_full_pipeline(config, global_results_df):
             step_start_time = time.perf_counter()
             
             with warnings.catch_warnings():
-                warnings.simplefilter("ignore", UserWarning)
-                warnings.simplefilter("ignore", RuntimeWarning)
+                warnings.simplefilter("ignore")
                 mem_usage = memory_usage((func, current_args, kwargs), max_usage=True, retval=True, interval=0.1)
             
             peak_mem_mib = mem_usage[0]
@@ -337,19 +276,17 @@ def run_full_pipeline(config, global_results_df):
             if i == 0:
                 spark_session = result
             else:
-                if df is not None:
-                    df.unpersist()
                 df = result
+                if i > 1 and step_name != "calculate_and_save_stats":
+                     df = df.cache()
+                     df.count() 
 
             elapsed_time = step_end_time - step_start_time
             cpu_time_used = (cpu_times_after.user - cpu_times_before.user) + (cpu_times_after.system - cpu_times_before.system)
             abs_start_time = step_start_time - pipeline_start_time
             abs_end_time = step_end_time - pipeline_start_time
             
-            print(f"  [END] Step: {step_name}")
-            print(f"    Exec Time: {elapsed_time:.4f} s")
-            print(f"    CPU Time: {cpu_time_used:.4f} s")
-            print(f"    Peak Mem: {peak_mem_mib:.2f} MiB")
+            print(f"  [END] Step: {step_name} ({elapsed_time:.4f}s)")
             
             run_results_list.append({
                 'config_name': config.get('name', 'N/A'),
@@ -364,13 +301,11 @@ def run_full_pipeline(config, global_results_df):
             })
     except Exception as e:
         print(f"!!! ERROR in pipeline config '{config['name']}' at step '{step_name}': {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
     finally:
         if spark_session:
-            try:
-                spark_session.stop()
-                print("  SparkSession stopped.")
-            except Exception as ce:
-                print(f"  Error while stopping SparkSession: {ce}", file=sys.stderr)
+            spark_session.stop()
         del df
         
     print(f"[END] Pipeline: {config['name']} finished.")
@@ -379,32 +314,28 @@ def run_full_pipeline(config, global_results_df):
 
 
 if __name__ == "__main__":
+    SPARK_MODE = os.environ.get("SPARK_MODE", "local")
     RESULTS_DIR = os.environ.get('SCRIPT_RESULTS_DIR') 
     if not RESULTS_DIR:
-        print("Error: SCRIPT_RESULTS_DIR environment variable not set. Run this via run.sh")
-        RESULTS_DIR = "results/local_test/nyc_taxi/spark"
+        RESULTS_DIR = f"results/local_test/nyc_taxi/spark_{SPARK_MODE}"
         os.makedirs(RESULTS_DIR, exist_ok=True)
 
     START_YEAR, START_MONTH = 2009, 1
-    END_YEAR, END_MONTH = 2025, 9
+    END_YEAR, END_MONTH = 2024, 12
     
     LOCAL_DATA_DIR = os.path.join(PROJECT_ROOT, "data", "nyc_taxi")
-    
     year_month_list = get_year_month_list(START_YEAR, START_MONTH, END_YEAR, END_MONTH)
-    
     all_files_sorted = download_taxi_data(year_month_list, LOCAL_DATA_DIR)
     
     if not all_files_sorted:
-        print("No data files found or downloaded. Exiting benchmark.")
         sys.exit(1)
 
     try:
         total_mem_bytes = psutil.virtual_memory().total
         total_mem_gb = total_mem_bytes / (1024**3)
         total_cores = psutil.cpu_count(logical=True)
-        print(f"System detected: {total_cores} logical cores, {total_mem_gb:.2f} GB RAM")
+        print(f"System detected: {total_cores} threads, {total_mem_gb:.2f} GB RAM")
     except Exception:
-        print("Could not detect system info, using defaults (4 cores, 8GB RAM).")
         total_mem_gb = 8.0
         total_cores = 4
     
@@ -413,13 +344,9 @@ if __name__ == "__main__":
     
     data_size_configs = {
         '1%': all_files_sorted[:max(1, int(total_file_count * 0.01))],
-        '2%': all_files_sorted[:max(1, int(total_file_count * 0.02))],
-        # '30%': all_files_sorted[:max(1, int(total_file_count * 0.30))],
-        # '100%': all_files_sorted,
+        # '10%': all_files_sorted[:max(1, int(total_file_count * 0.10))],
     }
     system_size_configs = {
-        # '10%': {'threads': max(1, int(total_cores * 0.10)), 'memory': f"{max(1, int(safe_max_mem_gb * 0.10))}GB"},
-        # '30%': {'threads': max(1, int(total_cores * 0.30)), 'memory': f"{max(1, int(safe_max_mem_gb * 0.30))}GB"},
         '100%': {'threads': total_cores, 'memory': f"{int(safe_max_mem_gb)}GB"}
     }
 
@@ -433,18 +360,9 @@ if __name__ == "__main__":
                 "data_size_pct": data_pct, "system_size_pct": sys_pct,
             })
     
-    print(f"\n--- Generated {len(CONFIGURATIONS)} test configurations for Spark ---")
-    
     all_results_df = pd.DataFrame()
     for config in CONFIGURATIONS:
         all_results_df = run_full_pipeline(config, all_results_df)
 
-    output_csv = os.path.join(RESULTS_DIR, 'spark_results.csv')
+    output_csv = os.path.join(RESULTS_DIR, f'spark_{SPARK_MODE}_results.csv')
     all_results_df.to_csv(output_csv, index=False)
-    
-    print(f"\n--- Spark benchmarks complete ---")
-    if not all_results_df.empty:
-        print(all_results_df[['config_name', 'step', 'execution_time_s', 'peak_memory_mib']])
-    else:
-        print("No results were generated.")
-    print(f"Full results saved to {output_csv}")

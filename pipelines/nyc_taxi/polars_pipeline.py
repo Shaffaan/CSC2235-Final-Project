@@ -16,18 +16,19 @@ sys.path.append(PROJECT_ROOT)
 
 from common.download_utils import get_year_month_list, download_taxi_data
 
-def calculate_and_save_stats(df, config):
+def calculate_and_save_stats(lf, config):
     """
     Calculates aggregate stats and saves them to a JSON file.
+    Triggers the computation (.collect()) here.
     """
-    print("  Calculating final statistics...")
+    print("  [ACTION] Executing full pipeline (collect)...")
     
     columns_to_check = [
         "trip_duration_mins", "speed_mph", "is_weekend",
         "fare_scaled", "dist_scaled", "speed_scaled"
     ]
     
-    aggs = [pl.count().alias("total_rows")]
+    aggs = [pl.len().alias("total_rows")]
     for col in columns_to_check:
         aggs.append(pl.col(col).sum().alias(f"{col}_sum"))
         aggs.append(pl.col(col).mean().alias(f"{col}_avg"))
@@ -35,7 +36,8 @@ def calculate_and_save_stats(df, config):
         aggs.append(pl.col(col).max().alias(f"{col}_max"))
         aggs.append(pl.col(col).is_null().sum().alias(f"{col}_nulls"))
 
-    stats_df = df.select(aggs)
+    # This is where the actual computation happens
+    stats_df = lf.select(aggs).collect()
     
     stats_list = stats_df.to_dicts() 
     
@@ -46,38 +48,36 @@ def calculate_and_save_stats(df, config):
         json.dump(stats_list, f, indent=2)
     
     print(f"  Final stats saved to {output_path}")
-    return df
+    return lf
 
 def connect_to_db(config):
     """
     Sets global Polars thread pool size based on config.
-    Polars doesn't have a 'connection', so this is a setup step.
-    Returns None, as the pipeline harness expects.
     """
     num_threads = config.get('num_threads')
     if num_threads:
         os.environ["POLARS_MAX_THREADS"] = str(num_threads)
     
-    os.environ["POLARS_PANIC_ON_OOM"] = "1"
+    # Enable streaming for large datasets to prevent OOM
+    os.environ["POLARS_AUTO_STREAMING"] = "1"
     
-    print(f"  Initialized Polars. Threads: {os.environ.get('POLARS_MAX_THREADS')}, Memory Limit: (System Managed)")
+    print(f"  Initialized Polars (Lazy). Threads: {os.environ.get('POLARS_MAX_THREADS')}, Streaming Enabled.")
     return None
 
 def load_data(con, config):
     """
-    Loads data using Polars' lazy 'scan_parquet' and then collects.
-    This correctly handles schema unification (union_by_name).
-    'con' (the connection) is ignored, as it's None.
-    Returns an eager Polars DataFrame.
+    Loads data using Polars' LAZY 'scan_parquet'.
+    Returns a LazyFrame.
     """
     data_files = config['data_files']
     if not data_files:
         raise ValueError("No data files specified in config['data_files']")
-    print(f"  Loading and unifying schema for {len(data_files)} files...")
+    print(f"  Defining LazyFrame for {len(data_files)} files...")
 
-    df = pl.scan_parquet(data_files).collect()
+    # union_by_name is handled efficiently by scan_parquet with wildcard or list
+    lf = pl.scan_parquet(data_files)
 
-    existing_cols = set(df.columns)
+    existing_cols = lf.columns
 
     schema_map = {
         'tpep_pickup_datetime':  ['tpep_pickup_datetime', 'Trip_Pickup_DateTime', 'pickup_datetime'],
@@ -88,8 +88,8 @@ def load_data(con, config):
     }
 
     select_expressions = []
-    all_source_cols_to_drop = set()
-
+    
+    # We construct the schema unification expressions
     for canonical_name, source_options in schema_map.items():
         cols_that_exist = [col for col in source_options if col in existing_cols]
         
@@ -98,49 +98,46 @@ def load_data(con, config):
         else:
             coalesce_exprs = [pl.col(c) for c in cols_that_exist]
             select_expressions.append(pl.coalesce(coalesce_exprs).alias(canonical_name))
-            all_source_cols_to_drop.update(cols_that_exist)
 
-    cols_to_keep = [c for c in existing_cols if c not in all_source_cols_to_drop]
+    # Select only unified columns to prune the query plan early
+    lf_unified = lf.select(select_expressions)
+
+    print(f"  LazyFrame defined (schema unification added).")
+    return lf_unified
+
+
+def handle_missing_values(lf, config):
+    print("  Adding imputation nodes to plan...")
     
-    df_unified = df.select(cols_to_keep + select_expressions)
-
-    count = len(df_unified)
-    print(f"  Loaded and unified {count} rows from {len(data_files)} files.")
-    return df_unified
-
-
-def handle_missing_values(df, config):
-    """
-    Accepts an eager DataFrame 'df' (instead of 'con')
-    and returns a new eager DataFrame.
-    """
-    print("  Imputing missing values...")
+    print("  [INTERMEDIATE] Computing global means for imputation...")
+    means_df = lf.select([
+        pl.col("fare_amount").filter(pl.col("fare_amount") > 0).mean().alias("mean_fare"),
+        pl.col("trip_distance").filter(pl.col("trip_distance") > 0).mean().alias("mean_dist")
+    ]).collect()
     
-    df_clean = df.with_columns(
+    mean_fare = means_df["mean_fare"][0] or 0.0
+    mean_dist = means_df["mean_dist"][0] or 0.0
+    
+    lf_clean = lf.with_columns(
         pl.when(pl.col("fare_amount").is_null() | (pl.col("fare_amount") <= 0))
-          .then(pl.col("fare_amount").filter(pl.col("fare_amount") > 0).mean())
+          .then(pl.lit(mean_fare))
           .otherwise(pl.col("fare_amount"))
           .alias("fare_amount_imputed"),
         
         pl.when(pl.col("trip_distance").is_null() | (pl.col("trip_distance") <= 0))
-          .then(pl.col("trip_distance").filter(pl.col("trip_distance") > 0).mean())
+          .then(pl.lit(mean_dist))
           .otherwise(pl.col("trip_distance"))
           .alias("trip_distance_imputed"),
         
         pl.col("payment_type").cast(pl.Int64, strict=False).fill_null(0).alias("payment_type_imputed")
     )
     
-    print("  Imputed missing values.")
-    return df_clean
+    return lf_clean
 
-def feature_engineering(df, config):
-    """
-    Performs feature engineering using Polars expressions.
-    Accepts and returns an eager DataFrame.
-    """
-    print("  Engineering features...")
+def feature_engineering(lf, config):
+    print("  Adding feature engineering nodes...")
 
-    df_with_duration = df.with_columns(
+    lf_with_duration = lf.with_columns(
         (
             (
                 pl.col("tpep_dropoff_datetime").str.to_datetime(strict=False) -
@@ -150,7 +147,7 @@ def feature_engineering(df, config):
         ).alias("trip_duration_mins")
     )
 
-    df_features = df_with_duration.with_columns(
+    lf_features = lf_with_duration.with_columns(
         pl.col("trip_duration_mins").fill_null(0).clip(lower_bound=0).alias("trip_duration_mins"),
         
         pl.col("tpep_pickup_datetime").str.to_datetime(strict=False)
@@ -164,16 +161,15 @@ def feature_engineering(df, config):
           .alias("speed_mph")
     )
     
-    print("  Engineered features: duration, speed, is_weekend.")
-    return df_features
+    return lf_features
 
-def categorical_encoding(df, config):
-    """
-    Performs one-hot encoding on the 'payment_type_imputed' column.
-    Accepts and returns an eager DataFrame.
-    """
-    payment_types = df.get_column("payment_type_imputed").unique(maintain_order=True).to_list()
-    print(f"  One-hot encoding for payment types: {payment_types}")
+def categorical_encoding(lf, config):
+    print("  [INTERMEDIATE] Scanning unique payment types...")
+    # We must know unique values to build columns. 
+    unique_df = lf.select("payment_type_imputed").unique().collect()
+    payment_types = unique_df["payment_type_imputed"].to_list()
+    
+    print(f"  Found {len(payment_types)} payment types.")
     
     select_clauses = []
     for pt in payment_types:
@@ -184,26 +180,24 @@ def categorical_encoding(df, config):
         select_clauses.append(clause)
         
     if not select_clauses:
-        print("  No payment types found to encode. Skipping.")
-        return df
+        return lf
         
-    df_encoded = df.with_columns(select_clauses)
-    print("  Performed one-hot encoding.")
-    return df_encoded
+    lf_encoded = lf.with_columns(select_clauses)
+    return lf_encoded
 
-def numerical_scaling(df, config):
-    """
-    Applies Min-Max scaling.
-    Accepts and returns an eager DataFrame.
-    """
-    params = df.select([
+def numerical_scaling(lf, config):
+    print("  [INTERMEDIATE] Aggregating Min/Max for Scaling...")
+    # Calculate global min/max
+    params_df = lf.select([
         pl.col("fare_amount_imputed").min().alias("min_fare"),
         pl.col("fare_amount_imputed").max().alias("max_fare"),
         pl.col("trip_distance_imputed").min().alias("min_dist"),
         pl.col("trip_distance_imputed").max().alias("max_dist"),
         pl.col("speed_mph").min().alias("min_speed"),
         pl.col("speed_mph").max().alias("max_speed"),
-    ]).row(0, named=True)
+    ]).collect()
+
+    params = params_df.row(0, named=True)
 
     min_fare = params.get("min_fare", 0) or 0
     max_fare = params.get("max_fare", 0) or 0
@@ -220,25 +214,19 @@ def numerical_scaling(df, config):
             return pl.lit(0.0)
         return (pl.col(col_name) - min_val) / denominator
         
-    df_scaled = df.with_columns([
+    lf_scaled = lf.with_columns([
         min_max_scaler("fare_amount_imputed", min_fare, max_fare).alias("fare_scaled"),
         min_max_scaler("trip_distance_imputed", min_dist, max_dist).alias("dist_scaled"),
         min_max_scaler("speed_mph", min_speed, max_speed).alias("speed_scaled")
     ])
     
-    print("  Applied Min-Max scaling.")
-    return df_scaled
+    return lf_scaled
 
 def run_full_pipeline(config, global_results_df):
-    """
-    Identical to the DuckDB harness.
-    The 'con' variable will just hold a Polars DataFrame
-    which is passed from step to step.
-    """
-    print(f"\n[BEGIN] Running pipeline: {config['name']}...")
+    print(f"\n[BEGIN] Running pipeline: {config['name']} (Polars LAZY)...")
     run_results_list = []
     pipeline_start_time = time.perf_counter()
-    con = None
+    lf = None
     
     pipeline_steps = [
         (connect_to_db, (config,), {}),
@@ -255,13 +243,13 @@ def run_full_pipeline(config, global_results_df):
             step_name = func.__name__
             
             if i > 0:
-                if con is None and i == 1:
+                if lf is None and i == 1:
                     args = (None, config)
                 else:
-                    if con is None:
-                        print(f"  DataFrame is missing. Stopping pipeline.")
+                    if lf is None:
+                        print(f"  LazyFrame is missing. Stopping pipeline.")
                         break
-                    args = (con, config)
+                    args = (lf, config)
 
             print(f"  [START] Step: {step_name}")
             process = psutil.Process(os.getpid())
@@ -277,7 +265,7 @@ def run_full_pipeline(config, global_results_df):
             step_end_time = time.perf_counter()
             cpu_times_after = process.cpu_times()
             
-            con = result
+            lf = result
             
             elapsed_time = step_end_time - step_start_time
             cpu_time_used = (cpu_times_after.user - cpu_times_before.user) + (cpu_times_after.system - cpu_times_before.system)
@@ -302,9 +290,10 @@ def run_full_pipeline(config, global_results_df):
             })
     except Exception as e:
         print(f"!!! ERROR in pipeline config '{config['name']}' at step '{step_name}': {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc()
     finally:
-        del con
-        print("  DataFrame cleared.")
+        del lf
         
     print(f"[END] Pipeline: {config['name']} finished.")
     run_results_df = pd.DataFrame(run_results_list)
@@ -319,7 +308,7 @@ if __name__ == "__main__":
         os.makedirs(RESULTS_DIR, exist_ok=True)
 
     START_YEAR, START_MONTH = 2009, 1
-    END_YEAR, END_MONTH = 2025, 9
+    END_YEAR, END_MONTH = 2024, 12
     
     LOCAL_DATA_DIR = os.path.join(PROJECT_ROOT, "data", "nyc_taxi")
     
@@ -346,13 +335,10 @@ if __name__ == "__main__":
     
     data_size_configs = {
         '1%': all_files_sorted[:max(1, int(total_file_count * 0.01))],
-        '2%': all_files_sorted[:max(1, int(total_file_count * 0.02))],
-        # '30%': all_files_sorted[:max(1, int(total_file_count * 0.30))],
+        # '10%': all_files_sorted[:max(1, int(total_file_count * 0.10))],
         # '100%': all_files_sorted,
     }
     system_size_configs = {
-        # '10%': {'threads': max(1, int(total_cores * 0.10)), 'memory': f"{max(1, int(safe_max_mem_gb * 0.10))}GB"},
-        # '30%': {'threads': max(1, int(total_cores * 0.30)), 'memory': f"{max(1, int(safe_max_mem_gb * 0.30))}GB"},
         '100%': {'threads': total_cores, 'memory': f"{int(safe_max_mem_gb)}GB"}
     }
 
@@ -366,7 +352,7 @@ if __name__ == "__main__":
                 "data_size_pct": data_pct, "system_size_pct": sys_pct,
             })
     
-    print(f"\n--- Generated {len(CONFIGURATIONS)} test configurations for Polars ---")
+    print(f"\n--- Generated {len(CONFIGURATIONS)} test configurations for Polars (Lazy) ---")
     
     all_results_df = pd.DataFrame()
     for config in CONFIGURATIONS:

@@ -16,11 +16,13 @@ RESULTS_DIR="results/$TIMESTAMP"
 mkdir -p "$RESULTS_DIR"
 
 VENV_PYTHON="/local/repository/.venv/bin/python3"
+export PYSPARK_PYTHON="$VENV_PYTHON"
+export PYSPARK_DRIVER_PYTHON="$VENV_PYTHON"
 
 # --- Cluster Discovery ---
 HOSTNAME=$(hostname)
 IS_DISTRIBUTED=false
-MASTER_URL=""
+SPARK_CLUSTER_STARTED=false
 
 if grep -q "node-1" /etc/hosts; then
     IS_DISTRIBUTED=true
@@ -31,7 +33,13 @@ if [ "$IS_DISTRIBUTED" = true ]; then
         echo "Error: In a distributed setup, please run benchmarks from node-0."
         exit 1
     fi
-    echo "--- Detected Distributed Cluster (5 Nodes) ---"
+    echo "--- Detected Distributed Environment (5 Nodes Available) ---"
+else
+    echo "--- Detected Single Node Setup ---"
+fi
+
+start_spark_cluster() {
+    echo "--- [Lazy Start] Setting up Distributed Spark Cluster ---"
     
     echo "--- Setting up Passwordless SSH for Cluster ---"
     USER_NAME=$(whoami)
@@ -67,11 +75,8 @@ if [ "$IS_DISTRIBUTED" = true ]; then
     echo "Waiting for workers to register..."
     sleep 10
     
-    export PYSPARK_PYTHON="$VENV_PYTHON"
-    export PYSPARK_DRIVER_PYTHON="$VENV_PYTHON"
-else
-    echo "--- Detected Single Node Setup ---"
-fi
+    SPARK_CLUSTER_STARTED=true
+}
 
 # --- Pipeline Identification ---
 TARGET_PIPELINES=()
@@ -116,6 +121,12 @@ for PIPELINE_NAME in "${TARGET_PIPELINES[@]}"; do
 
         for mode in "${MODES[@]}"; do
             
+            if [ "$mode" == "distributed" ]; then
+                if [ "$SPARK_CLUSTER_STARTED" = false ]; then
+                    start_spark_cluster
+                fi
+            fi
+
             if [ "$BASE_FRAMEWORK" == "spark" ]; then
                 FRAMEWORK_LABEL="spark_${mode}"
             else
@@ -127,8 +138,8 @@ for PIPELINE_NAME in "${TARGET_PIPELINES[@]}"; do
 
             echo "Running: $script (Mode: $mode)"
             
-            if [ "$IS_DISTRIBUTED" = true ]; then
-                echo "Clearing cache on cluster..."
+            if [ "$SPARK_CLUSTER_STARTED" = true ]; then
+                echo "Clearing cache on cluster (Master + Workers)..."
                 sudo sync; sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"
                 for i in {1..4}; do
                     ssh -o StrictHostKeyChecking=no node-$i "sudo sync; sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'"
@@ -149,7 +160,7 @@ for PIPELINE_NAME in "${TARGET_PIPELINES[@]}"; do
 done
 
 # --- Teardown ---
-if [ "$IS_DISTRIBUTED" = true ]; then
+if [ "$SPARK_CLUSTER_STARTED" = true ]; then
     echo "--- Tearing down Spark Cluster ---"
     $SPARK_HOME/sbin/stop-master.sh
     for i in {1..4}; do

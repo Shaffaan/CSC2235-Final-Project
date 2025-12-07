@@ -285,7 +285,7 @@ if __name__ == "__main__":
         os.makedirs(RESULTS_DIR, exist_ok=True)
 
     START_YEAR, START_MONTH = 2009, 1
-    END_YEAR, END_MONTH = 2025, 9
+    END_YEAR, END_MONTH = 2024, 12
     
     LOCAL_DATA_DIR = os.path.join(PROJECT_ROOT, "data", "nyc_taxi")
     
@@ -312,7 +312,7 @@ if __name__ == "__main__":
     
     data_size_configs = {
         '1%': all_files_sorted[:max(1, int(total_file_count * 0.01))],
-        '2%': all_files_sorted[:max(1, int(total_file_count * 0.02))],
+        # '2%': all_files_sorted[:max(1, int(total_file_count * 0.02))],
         # '30%': all_files_sorted[:max(1, int(total_file_count * 0.30))],
         # '100%': all_files_sorted,
     }

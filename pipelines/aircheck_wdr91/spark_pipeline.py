@@ -43,21 +43,43 @@ def connect_to_db(config):
     mem = config.get('memory_limit', '8g')
     if "GB" in mem: mem = mem.replace("GB", "g")
     
-    conf = SparkSession.builder.appName("Aircheck_Benchmark") \
-                      .config("spark.driver.memory", mem) \
-                      .master(f"local[{config.get('num_threads', '*')}]") \
-                      .config("spark.sql.execution.arrow.pyspark.enabled", "true")
+    # Check for distributed master provided by run_benchmarks.sh
+    master_url = os.environ.get("SPARK_MASTER_URL")
     
-    session = conf.getOrCreate()
+    builder = SparkSession.builder.appName("Aircheck_Benchmark")
+    
+    if master_url:
+        print(f"  [Distributed] Connecting to Master: {master_url}")
+        builder = builder.master(master_url)
+        # In distributed mode, 'memory_limit' applies to the executor
+        builder = builder.config("spark.executor.memory", mem)
+        builder = builder.config("spark.driver.memory", "4g") # Driver on node-0 needs less
+        builder = builder.config("spark.cores.max", int(config.get('num_threads', 12)) * 5) # Utilizing cluster cores
+    else:
+        print(f"  [Local] Connecting to local[*]")
+        builder = builder.master(f"local[{config.get('num_threads', '*')}]")
+        builder = builder.config("spark.driver.memory", mem)
+
+    builder = builder.config("spark.sql.execution.arrow.pyspark.enabled", "true")
+    
+    session = builder.getOrCreate()
     session.sparkContext.setLogLevel("ERROR")
-    print(f"  Connected to Spark. Mem: {mem}")
     return session
 
 def load_data(con, config):
     spark = con
     print(f"  Defining DataFrame (Parquet Read)...")
     cols = ['ALOGP', 'MW', 'NTC_VALUE', 'TARGET_VALUE', 'LABEL', 'BB1_ID', 'BB2_ID', 'TARGET_ID']
-    df = spark.read.parquet(*config['data_files']).select(*cols)
+    
+    # NOTE: In distributed mode with local files, we provide the absolute path.
+    # Since setup.sh runs on all nodes, this path exists on all nodes.
+    # Spark workers will read their local blocks if structured correctly, 
+    # or fail if they can't see the file. 
+    # For a 'fair' benchmark mimicking HDFS without HDFS, we assume the path is valid everywhere.
+    
+    files = [f"file://{os.path.abspath(f)}" for f in config['data_files']]
+    
+    df = spark.read.parquet(*files).select(*cols)
     
     df = df.withColumn("MW", F.col("MW").cast(DoubleType())) \
            .withColumn("ALOGP", F.col("ALOGP").cast(DoubleType())) \
@@ -152,6 +174,9 @@ def run_full_pipeline(config, global_results_df):
             cpu_before = process.cpu_times()
             start = time.perf_counter()
             
+            # Note: memory_profiler in distributed mode only measures the Driver.
+            # Distributed metrics require Spark Listener, but for this benchmark harness 
+            # we accept driver metrics as a proxy for "Orchestration Cost".
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 mem_usage = memory_usage((func, current_args, kwargs), max_usage=True, retval=True, interval=0.1)
@@ -190,6 +215,7 @@ if __name__ == "__main__":
         os.makedirs(RESULTS_DIR, exist_ok=True)
 
     LOCAL_DATA_DIR = os.path.join(PROJECT_ROOT, "data", "aircheck_wdr91")
+    # In distributed mode, this checks LOCAL node for file existence.
     all_files = download_aircheck_data(LOCAL_DATA_DIR)
     
     if not all_files: sys.exit(1)
@@ -198,11 +224,13 @@ if __name__ == "__main__":
         total_mem_bytes = psutil.virtual_memory().total
         total_mem_gb = total_mem_bytes / (1024**3)
         total_threads = psutil.cpu_count(logical=True)
-        print(f"System detected: {total_threads} threads, {total_mem_gb:.2f} GB RAM")
+        print(f"System detected (Node): {total_threads} threads, {total_mem_gb:.2f} GB RAM")
     except Exception:
         print("Could not detect system info.")
     
-    total_file_count = len(all_files)
+    # Configuration Logic
+    # If running distributed, we might want higher resource caps or different config names.
+    # For now, we keep the same logic but the run_pipeline function adapts the Spark Conf.
     
     data_size_configs = {
         '100%': all_files,
@@ -214,9 +242,6 @@ if __name__ == "__main__":
     CONFIGURATIONS = []
     for data_pct, file_list in data_size_configs.items():
         for sys_pct, sys_config in system_size_configs.items():
-            if total_threads < sys_config['threads'] or total_mem_gb < int(sys_config['memory'][:-2]):
-                print(f"  Skipping config {data_pct} data / {sys_pct} system due to insufficient resources.")
-                continue
             config_name = f"Data_{data_pct}_Sys_{sys_pct}"
             CONFIGURATIONS.append({
                 "name": config_name,

@@ -77,10 +77,8 @@ def download_aircheck_data(local_dir="data/aircheck_wdr91"):
         with urllib.request.urlopen(API_URL) as response:
             resp_body = response.read().decode('utf-8')
             
-            # Attempt to parse as JSON, otherwise assume body is the URL
             try:
                 data = json.loads(resp_body)
-                # Try common keys for signed URLs
                 signed_url = data.get('signedUrl') or data.get('url') or list(data.values())[0]
             except json.JSONDecodeError:
                 signed_url = resp_body.strip().strip('"')
@@ -95,3 +93,11 @@ def download_aircheck_data(local_dir="data/aircheck_wdr91"):
         if os.path.exists(local_path):
             os.remove(local_path)
         return []
+
+if __name__ == "__main__":
+    print("--- Executing automated data download ---")
+    base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+    
+    # Download Aircheck
+    ac_dir = os.path.join(base_path, "data", "aircheck_wdr91")
+    download_aircheck_data(ac_dir)

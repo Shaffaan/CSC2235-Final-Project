@@ -68,29 +68,32 @@ def download_taxi_data(year_month_list, local_dir="data/nyc_taxi"):
         file_name = f"yellow_tripdata_{year}-{month_str}.parquet"
         local_path = os.path.join(local_dir, file_name)
         
-        if current_block_start_year is not None and year >= current_block_start_year + 6 and month == 1 and i > 0:
-            delay_minutes = 3
-            print(f"\n--- PAUSING: Applying a {delay_minutes}-minute delay for NYC Taxi data (end of a 6-year block) ---")
-            time.sleep(delay_minutes * 60)
-            current_block_start_year = year
-            print("--- RESUMING Download ---")
-
-        downloaded_files.append(local_path)
+        download_occurred = False 
         
         if os.path.exists(local_path):
+            downloaded_files.append(local_path)
             continue
-            
+        
         print(f"  Downloading: {file_name} to {local_dir}/")
         url = f"{BASE_URL}{year}-{month_str}.parquet"
         try:
             urllib.request.urlretrieve(url, local_path)
             print(f"  Success: Downloaded {file_name}")
+            downloaded_files.append(local_path)
+            download_occurred = True
         except Exception as e:
             print(f"!!! Failed to download {url}: {e}")
             if os.path.exists(local_path):
                 os.remove(local_path)
-            downloaded_files.pop()
-            
+        
+        if download_occurred and current_block_start_year is not None and i > 0:
+             if year >= current_block_start_year + 6 and month == 1:
+                delay_minutes = 3
+                print(f"\n--- PAUSING: Applying a {delay_minutes}-minute delay for NYC Taxi data (end of a 6-year block) ---")
+                time.sleep(delay_minutes * 60)
+                current_block_start_year = year
+                print("--- RESUMING Download ---")
+
     return sorted(downloaded_files)
 
 def download_aircheck_data(local_dir="data/aircheck_wdr91"):

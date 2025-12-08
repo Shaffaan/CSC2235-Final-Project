@@ -352,12 +352,12 @@ if __name__ == "__main__":
     size_options = {
         "tiny": {"pages": 10_000, "items": 10_000, "link_annotated_text": 5_000, "properties": 3_000},
         "small": {"pages": 50_000, "items": 50_000, "link_annotated_text": 20_000, "properties": 10_000},
-        "medium": {"pages": 150_000, "items": 150_000, "link_annotated_text": 60_000, "properties": 25_000},
-        "large": {"pages": 300_000, "items": 300_000, "link_annotated_text": 120_000, "properties": 60_000},
-        "xlarge": {"pages": 600_000, "items": 600_000, "link_annotated_text": 240_000, "properties": 120_000},
-        "xxlarge": {"pages": 1_200_000, "items": 1_200_000, "link_annotated_text": 480_000, "properties": 200_000},
-        "mega": {"pages": 3_000_000, "items": 3_000_000, "link_annotated_text": 1_200_000, "properties": 400_000},
-        "full": {"pages": 5_362_174, "items": 6_824_000, "link_annotated_text": 5_343_565, "properties": 6_985},
+        # "medium": {"pages": 150_000, "items": 150_000, "link_annotated_text": 60_000, "properties": 25_000},
+        # "large": {"pages": 300_000, "items": 300_000, "link_annotated_text": 120_000, "properties": 60_000},
+        # "xlarge": {"pages": 600_000, "items": 600_000, "link_annotated_text": 240_000, "properties": 120_000},
+        # "xxlarge": {"pages": 1_200_000, "items": 1_200_000, "link_annotated_text": 480_000, "properties": 200_000},
+        # "mega": {"pages": 3_000_000, "items": 3_000_000, "link_annotated_text": 1_200_000, "properties": 400_000},
+        # "full": {"pages": 5_362_174, "items": 6_824_000, "link_annotated_text": 5_343_565, "properties": 6_985},
     }
     for label, limits in size_options.items():
         CONFIGURATIONS.append(

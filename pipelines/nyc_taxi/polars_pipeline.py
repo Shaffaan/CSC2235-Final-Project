@@ -109,7 +109,7 @@ def execute_deterministic_pipeline(config):
     return res
 
 def run_optimized_pipeline(config, global_results_df):
-    print(f"\n[BEGIN] Pipeline: {config['name']}")
+    print(f"\n[BEGIN] Pipeline: {config['name']} (Polars)...")
     start = time.perf_counter()
     configure_polars(config)
     
@@ -137,13 +137,55 @@ def run_optimized_pipeline(config, global_results_df):
 if __name__ == "__main__":
     RESULTS_DIR = os.environ.get('SCRIPT_RESULTS_DIR') or "results/local_test/nyc_taxi/polars"
     os.makedirs(RESULTS_DIR, exist_ok=True)
+    
     LOCAL_DATA_DIR = os.path.join(PROJECT_ROOT, "data", "nyc_taxi")
     files = download_taxi_data(get_year_month_list(2009, 1, 2024, 12), LOCAL_DATA_DIR)
     
-    config = {
-        "name": "Data_20%_Sys_100%", "data_files": files[:max(1, int(len(files) * 0.20))],
-        "num_threads": psutil.cpu_count(logical=True),
-        "data_size_pct": "20%", "system_size_pct": "100%"
+    if not files: sys.exit(1)
+
+    try:
+        total_mem_bytes = psutil.virtual_memory().total
+        total_mem_gb = total_mem_bytes / (1024**3)
+        total_threads = psutil.cpu_count(logical=True)
+        print(f"System detected: {total_threads} threads, {total_mem_gb:.2f} GB RAM")
+    except Exception:
+        print("Could not detect system info.")
+        total_threads = 4
+        total_mem_gb = 8
+
+    total_file_count = len(files)
+    
+    data_size_configs = {
+        '100%': files
     }
     
-    run_optimized_pipeline(config, pd.DataFrame()).to_csv(os.path.join(RESULTS_DIR, 'polars_results.csv'), index=False)
+    system_size_configs = {
+        '12t_16gb': {'threads': 12, 'memory': "16GB"},
+        '20t_64gb': {'threads': 20, 'memory': "64GB"},
+        '40t_128gb': {'threads': 40, 'memory': "128GB"},
+    }
+
+    CONFIGURATIONS = []
+    for data_pct, file_list in data_size_configs.items():
+        for sys_pct, sys_config in system_size_configs.items():
+            if total_threads < sys_config['threads'] or total_mem_gb < int(sys_config['memory'][:-2]):
+                print(f"  Skipping config {data_pct} data / {sys_pct} system due to insufficient resources.")
+                continue
+            
+            config_name = f"Data_{data_pct}_Sys_{sys_pct}"
+            CONFIGURATIONS.append({
+                "name": config_name,
+                "file_type": "parquet",
+                "data_files": file_list,
+                "memory_limit": sys_config['memory'],
+                "num_threads": sys_config['threads'],
+                "data_size_pct": data_pct,
+                "system_size_pct": sys_pct,
+            })
+    
+    all_results_df = pd.DataFrame()
+    for config in CONFIGURATIONS:
+        all_results_df = run_optimized_pipeline(config, all_results_df)
+
+    output_csv = os.path.join(RESULTS_DIR, 'polars_results.csv')
+    all_results_df.to_csv(output_csv, index=False)

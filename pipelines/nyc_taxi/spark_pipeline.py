@@ -144,7 +144,7 @@ def make_stat(config, step, t0, t1, c0, c1, pipeline_start, mem=0):
     }
 
 def run_optimized_pipeline(config, global_results_df):
-    print(f"\n[BEGIN] Pipeline: {config['name']}")
+    print(f"\n[BEGIN] Pipeline: {config['name']} (Spark)...")
     start_time = time.perf_counter()
     spark = None
     df = None
@@ -184,25 +184,55 @@ if __name__ == "__main__":
     if not RESULTS_DIR:
         RESULTS_DIR = f"results/local_test/nyc_taxi/spark_{SPARK_MODE}"
         os.makedirs(RESULTS_DIR, exist_ok=True)
-
+    
     LOCAL_DATA_DIR = os.path.join(PROJECT_ROOT, "data", "nyc_taxi")
     files = download_taxi_data(get_year_month_list(2009, 1, 2024, 12), LOCAL_DATA_DIR)
     
     if not files: sys.exit(1)
 
     try:
-        total_mem_gb = psutil.virtual_memory().total / (1024**3)
-        total_cores = psutil.cpu_count(logical=True)
-        print(f"System detected: {total_cores} threads, {total_mem_gb:.2f} GB RAM")
+        total_mem_bytes = psutil.virtual_memory().total
+        total_mem_gb = total_mem_bytes / (1024**3)
+        total_threads = psutil.cpu_count(logical=True)
+        print(f"System detected: {total_threads} threads, {total_mem_gb:.2f} GB RAM")
     except Exception:
-        total_mem_gb = 8.0
-        total_cores = 4
+        print("Could not detect system info.")
+        total_threads = 4
+        total_mem_gb = 8
+
+    total_file_count = len(files)
     
-    config = {
-        "name": "Data_20%_Sys_100%", "data_files": files[:max(1, int(len(files) * 0.20))],
-        "num_threads": total_cores,
-        "data_size_pct": "20%", "system_size_pct": "100%",
-        "memory_limit": f"{int(total_mem_gb * 0.8)}GB"
+    data_size_configs = {
+        '100%': files
     }
     
-    run_optimized_pipeline(config, pd.DataFrame()).to_csv(os.path.join(RESULTS_DIR, f'spark_{SPARK_MODE}_results.csv'), index=False)
+    system_size_configs = {
+        '12t_16gb': {'threads': 12, 'memory': "16GB"},
+        '20t_64gb': {'threads': 20, 'memory': "64GB"},
+        '40t_128gb': {'threads': 40, 'memory': "128GB"},
+    }
+
+    CONFIGURATIONS = []
+    for data_pct, file_list in data_size_configs.items():
+        for sys_pct, sys_config in system_size_configs.items():
+            if total_threads < sys_config['threads'] or total_mem_gb < int(sys_config['memory'][:-2]):
+                print(f"  Skipping config {data_pct} data / {sys_pct} system due to insufficient resources.")
+                continue
+            
+            config_name = f"Data_{data_pct}_Sys_{sys_pct}"
+            CONFIGURATIONS.append({
+                "name": config_name,
+                "file_type": "parquet",
+                "data_files": file_list,
+                "memory_limit": sys_config['memory'],
+                "num_threads": sys_config['threads'],
+                "data_size_pct": data_pct,
+                "system_size_pct": sys_pct,
+            })
+    
+    all_results_df = pd.DataFrame()
+    for config in CONFIGURATIONS:
+        all_results_df = run_optimized_pipeline(config, all_results_df)
+
+    output_csv = os.path.join(RESULTS_DIR, f'spark_{SPARK_MODE}_results.csv')
+    all_results_df.to_csv(output_csv, index=False)

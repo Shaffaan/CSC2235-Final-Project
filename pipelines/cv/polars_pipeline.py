@@ -23,8 +23,7 @@ SIZE_PRESET_LIMITS = {
     "tiny": 50_000,
     "small": 200_000,
     "medium": 1_000_000,
-    "large": 5_000_000,
-    "xlarge": 10_000_000,
+    "large": 10_000_000,
 }
 
 

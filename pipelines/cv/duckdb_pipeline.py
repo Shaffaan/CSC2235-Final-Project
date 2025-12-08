@@ -12,7 +12,7 @@ import pandas as pd
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.append(PROJECT_ROOT)
 
-from common.download_utils import (  # noqa: E402
+from common.download_utils import (
     download_openimages_class_descriptions,
     download_openimages_detection,
 )
@@ -24,8 +24,10 @@ SIZE_PRESET_LIMITS = {
     "tiny": 50_000,
     "small": 200_000,
     "medium": 1_000_000,
-    # "large": 5_000_000,
+    "large": 10_000_000,
 }
+REQUIRED_DETECTION_COLUMNS = {"ImageID", "LabelName", "XMin", "XMax", "YMin", "YMax"}
+OPTIONAL_DETECTION_COLUMNS = ["ImageWidth", "ImageHeight"]
 
 
 @dataclass
@@ -55,57 +57,103 @@ def _quote_literal(value: str) -> str:
     return value.replace("'", "''")
 
 
-def _table_columns(conn: duckdb.DuckDBPyConnection, table_name: str) -> List[str]:
-    return list(conn.execute(f"SELECT * FROM {table_name} LIMIT 0").fetchdf().columns)
+def _quote_identifier(name: str) -> str:
+    return '"' + name.replace('"', '""') + '"'
 
 
 def load_detections(
     conn: duckdb.DuckDBPyConnection, csv_path: str, limit: Optional[int]
-) -> int:
+) -> Tuple[duckdb.DuckDBPyRelation, int]:
     print(f"--- Loading detection annotations into DuckDB from {csv_path} ---")
     csv_literal = _quote_literal(csv_path)
-    conn.execute(
+    raw_rel = conn.sql(
         f"""
-        CREATE OR REPLACE TEMP VIEW detections_raw AS
-        SELECT * FROM read_csv_auto('{csv_literal}', SAMPLE_SIZE=-1)
-        """
-    )
-    if limit is not None:
-        conn.execute(
-            f"CREATE OR REPLACE TEMP VIEW detections AS SELECT * FROM detections_raw LIMIT {int(limit)}"
+        SELECT *
+        FROM read_csv_auto(
+            '{csv_literal}',
+            SAMPLE_SIZE=200000,
+            IGNORE_ERRORS=TRUE
         )
-    else:
-        conn.execute("CREATE OR REPLACE TEMP VIEW detections AS SELECT * FROM detections_raw")
-    row_count = conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0]
-    print(f"  Loaded {row_count:,} detection rows (limit={limit})")
-    return row_count
-
-
-def load_class_descriptions(conn: duckdb.DuckDBPyConnection, csv_path: str) -> int:
-    csv_literal = _quote_literal(csv_path)
-    conn.execute(
-        f"""
-        CREATE OR REPLACE TEMP VIEW class_map AS
-        SELECT * FROM read_csv_auto('{csv_literal}', SAMPLE_SIZE=-1)
         """
     )
-    columns = _table_columns(conn, "class_map")
+    available_columns = list(raw_rel.columns)
+    missing = REQUIRED_DETECTION_COLUMNS - set(available_columns)
+    if missing:
+        raise KeyError(
+            "Missing required detection columns: " + ", ".join(sorted(missing))
+        )
+    select_exprs: List[str] = [
+        "ImageID",
+        "LabelName",
+        "TRY_CAST(XMin AS DOUBLE) AS XMin",
+        "TRY_CAST(XMax AS DOUBLE) AS XMax",
+        "TRY_CAST(YMin AS DOUBLE) AS YMin",
+        "TRY_CAST(YMax AS DOUBLE) AS YMax",
+    ]
+    for column in OPTIONAL_DETECTION_COLUMNS:
+        if column in available_columns:
+            select_exprs.append(f"TRY_CAST({_quote_identifier(column)} AS DOUBLE) AS {column}")
+        else:
+            select_exprs.append(f"CAST(NULL AS DOUBLE) AS {column}")
+
+    raw_rel.create_view("cv_detections_raw", replace=True)
+    limit_clause = f"LIMIT {int(limit)}" if limit is not None else ""
+    select_clause = ",\n            ".join(select_exprs)
+    conn.execute(
+        f"""
+        CREATE OR REPLACE TEMP TABLE cv_detections AS
+        SELECT
+            {select_clause}
+        FROM cv_detections_raw
+        {limit_clause}
+        """
+    )
+    detections_rel = conn.sql("SELECT * FROM cv_detections")
+    row_count = detections_rel.aggregate("count(*) AS cnt").fetchone()[0]
+    print(f"  Loaded {row_count:,} detection rows (limit={limit})")
+    return detections_rel, row_count
+
+
+def load_class_descriptions(
+    conn: duckdb.DuckDBPyConnection, csv_path: str
+) -> Tuple[duckdb.DuckDBPyRelation, int]:
+    csv_literal = _quote_literal(csv_path)
+    raw_rel = conn.sql(
+        f"""
+        SELECT LabelName, DisplayName
+        FROM read_csv_auto('{csv_literal}', SAMPLE_SIZE=2000)
+        """
+    )
+    columns = set(raw_rel.columns)
     if not {"LabelName", "DisplayName"}.issubset(columns):
         raise KeyError("Expected columns 'LabelName' and 'DisplayName' in class descriptions")
-    row_count = conn.execute("SELECT COUNT(*) FROM class_map").fetchone()[0]
+    raw_rel.create_view("cv_class_raw", replace=True)
+    conn.execute(
+        """
+        CREATE OR REPLACE TEMP TABLE cv_class_map AS
+        SELECT LabelName, DisplayName
+        FROM cv_class_raw
+        """
+    )
+    class_rel = conn.sql("SELECT * FROM cv_class_map")
+    row_count = class_rel.aggregate("count(*) AS cnt").fetchone()[0]
     print(f"  Loaded {row_count:,} class description rows")
-    return row_count
+    return class_rel, row_count
 
 
-def compute_box_metrics(conn: duckdb.DuckDBPyConnection) -> None:
+def compute_box_metrics(
+    conn: duckdb.DuckDBPyConnection, detections_rel: duckdb.DuckDBPyRelation
+) -> duckdb.DuckDBPyRelation:
+    detection_columns = set(detections_rel.columns)
     required = {"ImageID", "LabelName", "XMin", "XMax", "YMin", "YMax"}
-    detection_columns = set(_table_columns(conn, "detections"))
     missing = required - detection_columns
     if missing:
         raise KeyError(f"Missing required detection columns: {', '.join(sorted(missing))}")
 
     has_image_dims = {"ImageWidth", "ImageHeight"}.issubset(detection_columns)
-    image_area_expr = "CAST(ImageWidth AS DOUBLE) * CAST(ImageHeight AS DOUBLE)" if has_image_dims else "NULL"
+    image_area_expr = (
+        "CAST(ImageWidth AS DOUBLE) * CAST(ImageHeight AS DOUBLE)" if has_image_dims else "NULL"
+    )
     box_area_px_expr = (
         "box_width * CAST(ImageWidth AS DOUBLE) * box_height * CAST(ImageHeight AS DOUBLE)"
         if has_image_dims
@@ -122,36 +170,36 @@ def compute_box_metrics(conn: duckdb.DuckDBPyConnection) -> None:
         else "box_area_ratio"
     )
 
+    detections_rel.create_view("cv_detections_view", replace=True)
     conn.execute(
         f"""
-        CREATE OR REPLACE TEMP VIEW detection_metrics AS
+        CREATE OR REPLACE TEMP TABLE cv_detection_metrics AS
         WITH base AS (
             SELECT
                 ImageID,
                 LabelName AS class_id,
-                CAST(XMin AS DOUBLE) AS XMin,
-                CAST(XMax AS DOUBLE) AS XMax,
-                CAST(YMin AS DOUBLE) AS YMin,
-                CAST(YMax AS DOUBLE) AS YMax,
-                GREATEST(CAST(XMax AS DOUBLE) - CAST(XMin AS DOUBLE), 0.0) AS box_width,
-                GREATEST(CAST(YMax AS DOUBLE) - CAST(YMin AS DOUBLE), 0.0) AS box_height,
+                XMin,
+                XMax,
+                YMin,
+                YMax,
+                GREATEST(XMax - XMin, 0.0) AS box_width,
+                GREATEST(YMax - YMin, 0.0) AS box_height,
                 GREATEST(
-                    GREATEST(CAST(XMax AS DOUBLE) - CAST(XMin AS DOUBLE), 0.0)
-                    * GREATEST(CAST(YMax AS DOUBLE) - CAST(YMin AS DOUBLE), 0.0),
+                    GREATEST(XMax - XMin, 0.0) * GREATEST(YMax - YMin, 0.0),
                     0.0
                 ) AS box_area_ratio,
                 {image_area_expr} AS image_area_px_raw,
                 {box_area_px_expr} AS box_area_px_raw,
                 {normalized_expr} AS normalized_area_raw
-            FROM detections
+            FROM cv_detections_view
         ),
         normalized AS (
             SELECT
                 *,
-                CASE
-                    WHEN normalized_area_raw IS NULL THEN 0.0
-                    ELSE LEAST(GREATEST(normalized_area_raw, 0.0), 1.0)
-                END AS normalized_area,
+                COALESCE(
+                    LEAST(GREATEST(normalized_area_raw, 0.0), 1.0),
+                    0.0
+                ) AS normalized_area,
                 image_area_px_raw AS image_area_px,
                 box_area_px_raw AS box_area_px
             FROM base
@@ -166,24 +214,35 @@ def compute_box_metrics(conn: duckdb.DuckDBPyConnection) -> None:
         FROM normalized
         """
     )
+    return conn.sql("SELECT * FROM cv_detection_metrics")
 
 
-def attach_class_names(conn: duckdb.DuckDBPyConnection) -> None:
+def attach_class_names(
+    conn: duckdb.DuckDBPyConnection,
+    metrics_rel: duckdb.DuckDBPyRelation,
+    class_rel: duckdb.DuckDBPyRelation,
+) -> duckdb.DuckDBPyRelation:
+    metrics_rel.create_view("cv_detection_metrics_view", replace=True)
+    class_rel.create_view("cv_class_map_view", replace=True)
     conn.execute(
         """
-        CREATE OR REPLACE TEMP VIEW detections_enriched AS
+        CREATE OR REPLACE TEMP TABLE cv_detections_enriched AS
         SELECT
             metrics.*,
             class_map.DisplayName AS class_name
-        FROM detection_metrics AS metrics
-        LEFT JOIN class_map
+        FROM cv_detection_metrics_view AS metrics
+        LEFT JOIN cv_class_map_view AS class_map
             ON metrics.class_id = class_map.LabelName
         """
     )
+    return conn.sql("SELECT * FROM cv_detections_enriched")
 
 
-def summarize_class_areas(conn: duckdb.DuckDBPyConnection) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    area_stats = conn.execute(
+def summarize_class_areas(
+    conn: duckdb.DuckDBPyConnection, enriched_rel: duckdb.DuckDBPyRelation
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    enriched_rel.create_view("cv_detections_enriched", replace=True)
+    area_stats = conn.sql(
         """
         SELECT
             class_id,
@@ -192,40 +251,43 @@ def summarize_class_areas(conn: duckdb.DuckDBPyConnection) -> Tuple[pd.DataFrame
             AVG(normalized_area) AS mean_norm_area,
             MEDIAN(normalized_area) AS median_norm_area,
             STDDEV_POP(normalized_area) AS std_norm_area
-        FROM detections_enriched
+        FROM cv_detections_enriched
         GROUP BY class_id, class_name
         ORDER BY detections DESC
         """
-    ).fetchdf()
+    ).df()
 
-    bucket_counts = conn.execute(
+    bucket_counts = conn.sql(
         """
         SELECT
             class_id,
             class_name,
             size_bucket,
             COUNT(*) AS detections
-        FROM detections_enriched
+        FROM cv_detections_enriched
         GROUP BY class_id, class_name, size_bucket
         ORDER BY class_id, size_bucket
         """
-    ).fetchdf()
+    ).df()
 
     return area_stats, bucket_counts
 
 
-def summarize_bucket_distribution(conn: duckdb.DuckDBPyConnection) -> pd.DataFrame:
-    return conn.execute(
+def summarize_bucket_distribution(
+    conn: duckdb.DuckDBPyConnection, enriched_rel: duckdb.DuckDBPyRelation
+) -> pd.DataFrame:
+    enriched_rel.create_view("cv_detections_enriched", replace=True)
+    return conn.sql(
         """
         SELECT
             size_bucket,
             COUNT(*) AS detections,
             AVG(normalized_area) AS avg_normalized_area
-        FROM detections_enriched
+        FROM cv_detections_enriched
         GROUP BY size_bucket
         ORDER BY size_bucket
         """
-    ).fetchdf()
+    ).df()
 
 
 def persist_results(
@@ -273,21 +335,21 @@ def run_openimages_pipeline(config: OpenImagesConfig) -> Dict[str, Any]:
     conn = duckdb.connect(database=":memory:")
     try:
         start = time.perf_counter()
-        rows_loaded = load_detections(conn, annotations_path, config.limit)
+        detections_rel, rows_loaded = load_detections(conn, annotations_path, config.limit)
         _record_timing(timings, "load_detections", start, rows=rows_loaded)
 
         start = time.perf_counter()
-        classes_loaded = load_class_descriptions(conn, class_map_path)
+        class_rel, classes_loaded = load_class_descriptions(conn, class_map_path)
         _record_timing(timings, "load_class_map", start, classes=classes_loaded)
 
         start = time.perf_counter()
-        compute_box_metrics(conn)
-        attach_class_names(conn)
-        enriched_rows = conn.execute("SELECT COUNT(*) FROM detections_enriched").fetchone()[0]
+        metrics_rel = compute_box_metrics(conn, detections_rel)
+        enriched_rel = attach_class_names(conn, metrics_rel, class_rel)
+        enriched_rows = enriched_rel.aggregate("count(*) AS cnt").fetchone()[0]
         _record_timing(timings, "compute_metrics_and_join", start, rows=enriched_rows)
 
         start = time.perf_counter()
-        area_stats, bucket_counts = summarize_class_areas(conn)
+        area_stats, bucket_counts = summarize_class_areas(conn, enriched_rel)
         _record_timing(
             timings,
             "group_area_by_class",
@@ -297,7 +359,7 @@ def run_openimages_pipeline(config: OpenImagesConfig) -> Dict[str, Any]:
         )
 
         start = time.perf_counter()
-        bucket_summary = summarize_bucket_distribution(conn)
+        bucket_summary = summarize_bucket_distribution(conn, enriched_rel)
         _record_timing(timings, "group_bucket_distribution", start, buckets=len(bucket_summary))
 
         results_dir = config.resolve_results_dir()

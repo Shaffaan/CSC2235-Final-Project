@@ -67,7 +67,7 @@ if [ ! -d "$SPARK_DIR" ]; then
     cd - > /dev/null
 fi
 
-sudo -u "$USER_NAME" bash -c "
+sudo -H -u "$USER_NAME" bash -c "
     # Setup Venv
     if [ ! -d /local/repository/.venv ]; then
         echo 'Creating venv...' | sudo tee -a /local/repository/setup.log

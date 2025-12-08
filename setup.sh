@@ -18,6 +18,9 @@ if [ -n "$BIG_DISK" ]; then
     sudo mkdir -p "$MOUNT_POINT"
     sudo mount "$DISK_PATH" "$MOUNT_POINT"
     
+    sudo mkdir -p "$MOUNT_POINT/data"
+    sudo mkdir -p "$MOUNT_POINT/tmp"
+
     sudo chown -R "$USER_NAME" "$MOUNT_POINT"
     
     mkdir -p "$MOUNT_POINT/data"

@@ -3,15 +3,38 @@ import urllib.request
 import urllib.parse
 import json
 import time
-
-from common.download_sqllite import ensure_sqlite_dataset
+import kagglehub
 
 OPENIMAGES_BASE_URL = "https://storage.googleapis.com/openimages/v6"
 
+def download_wikipedia_data(download_dir: str) -> str:
+    """
+    Ensures the Wikipedia SQLite dataset is downloaded.
+    If the dataset already exists in download_dir, it is reused.
+    Otherwise, it is downloaded via kagglehub.
+    Returns: absolute path to dataset directory.
+    """
+    expected_subdir = os.path.join(download_dir, "wikipedia-sqlite-portable-db-huge-5m-rows")
+    
+    if os.path.isdir(expected_subdir) and len(os.listdir(expected_subdir)) > 0:
+        print(f"Using existing SQLite dataset at: {expected_subdir}")
+        return expected_subdir
+
+    print("Dataset not found locally. Downloading via kagglehub...")
+    try:
+        path = kagglehub.dataset_download(
+            "christernyc/wikipedia-sqlite-portable-db-huge-5m-rows"
+        )
+        print(f"Dataset downloaded to: {path}")
+        return path
+    except Exception as e:
+        print(f"KaggleHub reported: {e}")
+        if os.path.exists(expected_subdir):
+             return expected_subdir
+        raise e
+
 def get_year_month_list(start_year, start_month, end_year, end_month):
-    """
-    Generates a list of (year, month) tuples within the specified range.
-    """
+    """Generates a list of (year, month) tuples within the specified range."""
     ym_list = []
     year = start_year
     month = start_month
@@ -30,10 +53,7 @@ def get_year_month_list(start_year, start_month, end_year, end_month):
     return ym_list
 
 def download_taxi_data(year_month_list, local_dir="data/nyc_taxi"):
-    """
-    Downloads NYC Taxi data for the given list of (year, month) tuples.
-    Returns a sorted list of all downloaded file paths.
-    """
+    """Downloads NYC Taxi data for the given list of (year, month) tuples."""
     os.makedirs(local_dir, exist_ok=True)
     BASE_URL = "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_"
     
@@ -63,9 +83,7 @@ def download_taxi_data(year_month_list, local_dir="data/nyc_taxi"):
     return sorted(downloaded_files)
 
 def download_aircheck_data(local_dir="data/aircheck_wdr91"):
-    """
-    Fetches the signed URL and downloads the WDR91 parquet file.
-    """
+    """Fetches the signed URL and downloads the WDR91 parquet file."""
     os.makedirs(local_dir, exist_ok=True)
     file_name = "WDR91.parquet"
     local_path = os.path.join(local_dir, file_name)
@@ -98,7 +116,6 @@ def download_aircheck_data(local_dir="data/aircheck_wdr91"):
             os.remove(local_path)
         return []
 
-
 def _download_file(url: str, dest_path: str) -> bool:
     """Downloads a file to the destination path if it does not exist."""
     try:
@@ -114,7 +131,6 @@ def _download_file(url: str, dest_path: str) -> bool:
         if os.path.exists(dest_path):
             os.remove(dest_path)
         return False
-
 
 def download_openimages_detection(
     local_dir: str = "data/cv_openimages",
@@ -138,8 +154,6 @@ def download_openimages_detection(
             return dest_path
 
     raise RuntimeError("All OpenImages mirrors failed.")
-
-
 
 def download_openimages_class_descriptions(
     local_dir: str = "data/cv_openimages",
@@ -175,4 +189,9 @@ if __name__ == "__main__":
     # 3. Download Kaggle Wikipedia SQLite dataset
     wiki_dir = os.path.join(base_path, "data", "sqlite_datasets")
     os.makedirs(wiki_dir, exist_ok=True)
-    ensure_sqlite_dataset(wiki_dir)
+    download_wikipedia_data(wiki_dir)
+    
+    # 4. Download CV (OpenImages) Metadata
+    cv_dir = os.path.join(base_path, "data", "cv_openimages")
+    download_openimages_detection(cv_dir)
+    download_openimages_class_descriptions(cv_dir)

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# --- Fair Benchmarking Harness (Distributed Capable) ---
+# --- Fair Benchmarking Harness
 
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 export SPARK_HOME=/opt/spark
@@ -28,53 +28,29 @@ if grep -q "node-1" /etc/hosts; then
     IS_DISTRIBUTED=true
 fi
 
-if [ "$IS_DISTRIBUTED" = true ]; then
-    if [[ "$HOSTNAME" != *"node-0"* ]]; then
-        echo "Error: In a distributed setup, please run benchmarks from node-0."
-        exit 1
-    fi
-    echo "--- Detected Distributed Environment (5 Nodes Available) ---"
-else
-    echo "--- Detected Single Node Setup ---"
+if [ "$IS_DISTRIBUTED" = true ] && [[ "$HOSTNAME" != *"node-0"* ]]; then
+    echo "Error: Run benchmarks from node-0."
+    exit 1
 fi
 
 start_spark_cluster() {
     echo "--- [Lazy Start] Setting up Distributed Spark Cluster ---"
-    
-    echo "--- Setting up Passwordless SSH for Cluster ---"
     USER_NAME=$(whoami)
-    
     if [ ! -f "$HOME/.ssh/id_rsa" ]; then
-        echo "Generating SSH key for $USER_NAME..."
         ssh-keygen -t rsa -N "" -f "$HOME/.ssh/id_rsa"
     fi
-
     for i in {1..4}; do
-        WORKER_NODE="node-$i"
-        echo "Propagating public key to $WORKER_NODE..."
-        
-        cat "$HOME/.ssh/id_rsa.pub" | sudo ssh -o StrictHostKeyChecking=no "$WORKER_NODE" \
+        cat "$HOME/.ssh/id_rsa.pub" | sudo ssh -o StrictHostKeyChecking=no "node-$i" \
             "mkdir -p /users/$USER_NAME/.ssh && cat >> /users/$USER_NAME/.ssh/authorized_keys"
     done
-    
-    # 1. Start Spark Master on Node 0
-    echo "Starting Spark Master on node-0..."
     $SPARK_HOME/sbin/stop-master.sh
     SPARK_MASTER_HOST=0.0.0.0 $SPARK_HOME/sbin/start-master.sh
-    
     sleep 3
-    MASTER_URL="spark://node-0:7077"
-    export SPARK_MASTER_URL="$MASTER_URL"
-    
+    export SPARK_MASTER_URL="spark://node-0:7077"
     for i in {1..4}; do
-        WORKER_HOST="node-$i"
-        echo "Starting Spark Worker on $WORKER_HOST..."
-        ssh -o StrictHostKeyChecking=no $WORKER_HOST "$SPARK_HOME/sbin/stop-worker.sh; nohup $SPARK_HOME/sbin/start-worker.sh $MASTER_URL > /dev/null 2>&1 &"
+        ssh -o StrictHostKeyChecking=no "node-$i" "$SPARK_HOME/sbin/stop-worker.sh; nohup $SPARK_HOME/sbin/start-worker.sh $SPARK_MASTER_URL > /dev/null 2>&1 &"
     done
-    
-    echo "Waiting for workers to register..."
     sleep 10
-    
     SPARK_CLUSTER_STARTED=true
 }
 
@@ -99,18 +75,18 @@ for PIPELINE_NAME in "${TARGET_PIPELINES[@]}"; do
 
     TARGET_SCRIPTS=()
     if [ -z "$FRAMEWORK_NAME_ARG" ]; then
-        for script in $(find "$PIPELINE_DIR" -maxdepth 1 -name "*_pipeline.py" ! -name "__init__.py"); do
+        while IFS= read -r script; do
             TARGET_SCRIPTS+=("$script")
-        done
+        done < <(find "$PIPELINE_DIR" -maxdepth 1 -name "*_pipeline.py" ! -name "__init__.py" | sort)
     else
         TARGET_SCRIPTS=("$PIPELINE_DIR/${FRAMEWORK_NAME_ARG}_pipeline.py")
     fi
 
     for script in "${TARGET_SCRIPTS[@]}"; do
+        if [ ! -f "$script" ]; then continue; fi
+        
         BASE_FRAMEWORK=$(basename "$script" _pipeline.py)
-        
         MODES=("standard")
-        
         if [ "$BASE_FRAMEWORK" == "spark" ]; then
             if [ "$IS_DISTRIBUTED" = true ]; then
                 MODES=("local" "distributed")
@@ -120,11 +96,8 @@ for PIPELINE_NAME in "${TARGET_PIPELINES[@]}"; do
         fi
 
         for mode in "${MODES[@]}"; do
-            
-            if [ "$mode" == "distributed" ]; then
-                if [ "$SPARK_CLUSTER_STARTED" = false ]; then
-                    start_spark_cluster
-                fi
+            if [ "$mode" == "distributed" ] && [ "$SPARK_CLUSTER_STARTED" = false ]; then
+                start_spark_cluster
             fi
 
             if [ "$BASE_FRAMEWORK" == "spark" ]; then
@@ -139,7 +112,6 @@ for PIPELINE_NAME in "${TARGET_PIPELINES[@]}"; do
             echo "Running: $script (Mode: $mode)"
             
             if [ "$SPARK_CLUSTER_STARTED" = true ]; then
-                echo "Clearing cache on cluster (Master + Workers)..."
                 sudo sync; sudo sh -c "echo 3 > /proc/sys/vm/drop_caches"
                 for i in {1..4}; do
                     ssh -o StrictHostKeyChecking=no node-$i "sudo sync; sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'"

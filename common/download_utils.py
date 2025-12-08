@@ -4,15 +4,13 @@ import urllib.parse
 import json
 import time
 import kagglehub
+import concurrent.futures
 
 OPENIMAGES_BASE_URL = "https://storage.googleapis.com/openimages/v6"
 
 def download_wikipedia_data(download_dir: str) -> str:
     """
     Ensures the Wikipedia SQLite dataset is downloaded.
-    If the dataset already exists in download_dir, it is reused.
-    Otherwise, it is downloaded via kagglehub.
-    Returns: absolute path to dataset directory.
     """
     expected_subdir = os.path.join(download_dir, "wikipedia-sqlite-portable-db-huge-5m-rows")
     
@@ -30,7 +28,7 @@ def download_wikipedia_data(download_dir: str) -> str:
     except Exception as e:
         print(f"KaggleHub reported: {e}")
         if os.path.exists(expected_subdir):
-             return expected_subdir
+            return expected_subdir
         raise e
 
 def get_year_month_list(start_year, start_month, end_year, end_month):
@@ -53,17 +51,30 @@ def get_year_month_list(start_year, start_month, end_year, end_month):
     return ym_list
 
 def download_taxi_data(year_month_list, local_dir="data/nyc_taxi"):
-    """Downloads NYC Taxi data for the given list of (year, month) tuples."""
+    """
+    Downloads NYC Taxi data for the given list of (year, month) tuples,
+    adding a 3-minute delay every 6 years.
+    """
     os.makedirs(local_dir, exist_ok=True)
     BASE_URL = "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_"
     
     print(f"--- Checking for local data in '{local_dir}' ---")
     downloaded_files = []
     
-    for year, month in year_month_list:
+    current_block_start_year = year_month_list[0][0] if year_month_list else None
+    
+    for i, (year, month) in enumerate(year_month_list):
         month_str = f"{month:02d}"
         file_name = f"yellow_tripdata_{year}-{month_str}.parquet"
         local_path = os.path.join(local_dir, file_name)
+        
+        if current_block_start_year is not None and year >= current_block_start_year + 6 and month == 1 and i > 0:
+            delay_minutes = 3
+            print(f"\n--- PAUSING: Applying a {delay_minutes}-minute delay for NYC Taxi data (end of a 6-year block) ---")
+            time.sleep(delay_minutes * 60)
+            current_block_start_year = year
+            print("--- RESUMING Download ---")
+
         downloaded_files.append(local_path)
         
         if os.path.exists(local_path):
@@ -177,21 +188,40 @@ if __name__ == "__main__":
     print("--- Executing automated data download (Setup Phase) ---")
     base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
     
-    # 1. Download Aircheck
     ac_dir = os.path.join(base_path, "data", "aircheck_wdr91")
-    download_aircheck_data(ac_dir)
-
-    # 2. Download NYC Taxi
     taxi_dir = os.path.join(base_path, "data", "nyc_taxi")
-    ym_list = get_year_month_list(2009, 1, 2024, 12)
-    download_taxi_data(ym_list, taxi_dir)
-
-    # 3. Download Kaggle Wikipedia SQLite dataset
     wiki_dir = os.path.join(base_path, "data", "sqlite_datasets")
-    os.makedirs(wiki_dir, exist_ok=True)
-    download_wikipedia_data(wiki_dir)
-    
-    # 4. Download CV (OpenImages) Metadata
     cv_dir = os.path.join(base_path, "data", "cv_openimages")
-    download_openimages_detection(cv_dir)
-    download_openimages_class_descriptions(cv_dir)
+
+    os.makedirs(wiki_dir, exist_ok=True)
+    os.makedirs(cv_dir, exist_ok=True)
+
+    ym_list = get_year_month_list(2009, 1, 2024, 12)
+    
+    tasks = [
+        (download_aircheck_data, [ac_dir]),
+        (download_wikipedia_data, [wiki_dir]),
+        (download_openimages_detection, [cv_dir]),
+        (download_openimages_class_descriptions, [cv_dir]),
+    ]
+
+    print("\n--- Starting Parallel Downloads (Aircheck, Wikipedia, OpenImages) ---")
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_task = {
+            executor.submit(func, *args): f"Downloading {func.__name__}"
+            for func, args in tasks
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_task):
+            task_name = future_to_task[future]
+            try:
+                result = future.result()
+                print(f"{task_name} completed successfully.")
+            except Exception as exc:
+                print(f"{task_name} generated an exception: {exc}")
+                
+    print("\n--- Starting Sequential NYC Taxi Download with Delays ---")
+    download_taxi_data(ym_list, taxi_dir)
+    
+    print("\n--- All Downloads Completed ---")

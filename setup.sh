@@ -1,12 +1,49 @@
 #!/bin/bash
 echo "Setup script is running as $(whoami) on $(hostname)..." | sudo tee -a /local/repository/setup.log
 
-# 1. Install System Dependencies
+USER_NAME=$(stat -c '%U' /local/repository)
+
+echo "Checking for unmounted high-capacity disks..." | sudo tee -a /local/repository/setup.log
+
+BIG_DISK=$(lsblk -dn -o NAME,SIZE,TYPE,MOUNTPOINT -b | awk '$3=="disk" && $4=="" {print $1, $2}' | sort -rn -k2 | head -1 | awk '{print $1}')
+
+if [ -n "$BIG_DISK" ]; then
+    DISK_PATH="/dev/$BIG_DISK"
+    MOUNT_POINT="/mnt/fast_storage"
+    
+    echo "Found unmounted large disk: $DISK_PATH. Formatting and mounting..." | sudo tee -a /local/repository/setup.log
+    
+    sudo mkfs.ext4 -F "$DISK_PATH"
+    
+    sudo mkdir -p "$MOUNT_POINT"
+    sudo mount "$DISK_PATH" "$MOUNT_POINT"
+    
+    sudo chown -R "$USER_NAME" "$MOUNT_POINT"
+    
+    mkdir -p "$MOUNT_POINT/data"
+
+    if [ -d "/local/repository/data" ] && [ ! -L "/local/repository/data" ]; then
+        mv /local/repository/data/* "$MOUNT_POINT/data/" 2>/dev/null
+        rmdir /local/repository/data
+    fi
+    ln -sfn "$MOUNT_POINT/data" /local/repository/data
+    
+    mkdir -p "$MOUNT_POINT/tmp"
+    if [ -d "/local/repository/.tmp" ] && [ ! -L "/local/repository/.tmp" ]; then
+        rm -rf /local/repository/.tmp
+    fi
+    mkdir -p /local/repository
+    ln -sfn "$MOUNT_POINT/tmp" /local/repository/.tmp
+    
+    echo "Storage setup complete. /local/repository/data and .tmp now point to $DISK_PATH" | sudo tee -a /local/repository/setup.log
+else
+    echo "No unmounted disk found. Proceeding with root storage (RISKY)." | sudo tee -a /local/repository/setup.log
+fi
+
+
 sudo DEBIAN_FRONTEND=noninteractive apt-get -y update
 sudo DEBIAN_FRONTEND=noninteractive apt-get -y install python3-venv python3-pip openjdk-17-jdk-headless wget
 
-# 2. Identify User
-USER_NAME=$(stat -c '%U' /local/repository)
 USER_HOME=$(getent passwd "$USER_NAME" | cut -d: -f6)
 
 if [ -z "$USER_NAME" ] || [ -z "$USER_HOME" ]; then
@@ -14,14 +51,12 @@ if [ -z "$USER_NAME" ] || [ -z "$USER_HOME" ]; then
     exit 1
 fi
 
-# 3. Install Standalone Spark Binaries (Required for Cluster Management)
 SPARK_VERSION="3.5.0"
 SPARK_DIR="/opt/spark"
 if [ ! -d "$SPARK_DIR" ]; then
     echo "Installing Spark Binaries to $SPARK_DIR..." | sudo tee -a /local/repository/setup.log
     
     cd /tmp
-
     wget -q https://archive.apache.org/dist/spark/spark-${SPARK_VERSION}/spark-${SPARK_VERSION}-bin-hadoop3.tgz
     
     sudo tar xf spark-${SPARK_VERSION}-bin-hadoop3.tgz
@@ -29,11 +64,9 @@ if [ ! -d "$SPARK_DIR" ]; then
     sudo chown -R "$USER_NAME" "$SPARK_DIR"
     
     rm spark-${SPARK_VERSION}-bin-hadoop3.tgz
-    
     cd - > /dev/null
 fi
 
-# 4. Setup Python Environment and Download Data
 sudo -u "$USER_NAME" bash -c "
     # Setup Venv
     if [ ! -d /local/repository/.venv ]; then
@@ -47,8 +80,7 @@ sudo -u "$USER_NAME" bash -c "
     fi
 
     # Trigger Data Download on THIS node
-    echo 'Downloading Aircheck Data locally...' | sudo tee -a /local/repository/setup.log
-    # We execute the module as a script to trigger the download logic
+    echo 'Downloading Data...' | sudo tee -a /local/repository/setup.log
     export PYTHONPATH=/local/repository
     python3 /local/repository/common/download_utils.py
 "

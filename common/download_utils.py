@@ -6,6 +6,8 @@ import time
 
 from common.download_sqllite import ensure_sqlite_dataset
 
+OPENIMAGES_BASE_URL = "https://storage.googleapis.com/openimages/v6"
+
 def get_year_month_list(start_year, start_month, end_year, end_month):
     """
     Generates a list of (year, month) tuples within the specified range.
@@ -95,6 +97,67 @@ def download_aircheck_data(local_dir="data/aircheck_wdr91"):
         if os.path.exists(local_path):
             os.remove(local_path)
         return []
+
+
+def _download_file(url: str, dest_path: str) -> bool:
+    """Downloads a file to the destination path if it does not exist."""
+    try:
+        tmp_path = f"{dest_path}.tmp"
+        urllib.request.urlretrieve(url, tmp_path)
+        os.replace(tmp_path, dest_path)
+        return True
+    except Exception as exc:
+        print(f"!!! Failed to download {url}: {exc}")
+        tmp_path = f"{dest_path}.tmp"
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        if os.path.exists(dest_path):
+            os.remove(dest_path)
+        return False
+
+
+def download_openimages_detection(
+    local_dir: str = "data/cv_openimages",
+    annotation_filename: str = "oidv6-train-annotations-bbox.csv",
+) -> str:
+    os.makedirs(local_dir, exist_ok=True)
+    dest_path = os.path.join(local_dir, annotation_filename)
+    if os.path.exists(dest_path):
+        return dest_path
+
+    mirrors = [
+        f"https://raw.githubusercontent.com/cvdfoundation/open-images-dataset/master/dataset/oidv6/{annotation_filename}",
+        f"https://storage.googleapis.com/openimages/v6/{annotation_filename}",
+    ]
+
+    print(f"  Downloading Open Images detection annotations to {dest_path}...")
+    for url in mirrors:
+        print(f"    Trying {url}")
+        if _download_file(url, dest_path):
+            print("  Success!")
+            return dest_path
+
+    raise RuntimeError("All OpenImages mirrors failed.")
+
+
+
+def download_openimages_class_descriptions(
+    local_dir: str = "data/cv_openimages",
+    class_filename: str = "oidv6-class-descriptions.csv",
+) -> str:
+    """Ensures the Open Images class description mapping exists locally."""
+    os.makedirs(local_dir, exist_ok=True)
+    dest_path = os.path.join(local_dir, class_filename)
+    if os.path.exists(dest_path):
+        print(f"  Open Images class descriptions already exist at {dest_path}")
+        return dest_path
+
+    url = f"{OPENIMAGES_BASE_URL}/{class_filename}"
+    print(f"  Downloading Open Images class descriptions to {dest_path}...")
+    if _download_file(url, dest_path):
+        print("  Success: downloaded class descriptions")
+        return dest_path
+    raise RuntimeError(f"Failed to download class descriptions from {url}")
 
 if __name__ == "__main__":
     print("--- Executing automated data download (Setup Phase) ---")

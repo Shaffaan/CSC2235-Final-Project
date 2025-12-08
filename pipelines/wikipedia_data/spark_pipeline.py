@@ -1,6 +1,5 @@
 import json
 import os
-import sqlite3
 import sys
 import time
 import warnings
@@ -80,8 +79,11 @@ def create_spark_session(config: Dict[str, Any]) -> SparkSession:
         builder = builder.master(f"local[{threads}]")
         builder = builder.config("spark.driver.memory", exec_mem)
 
+    jdbc_packages = config.get("spark_jars_packages", "org.xerial:sqlite-jdbc:3.45.1.0")
+
     builder = builder.config("spark.sql.shuffle.partitions", config.get("shuffle_partitions", 200))
     builder = builder.config("spark.sql.execution.arrow.pyspark.enabled", "true")
+    builder = builder.config("spark.jars.packages", jdbc_packages)
 
     session = builder.getOrCreate()
     session.sparkContext.setLogLevel("WARN")
@@ -90,7 +92,7 @@ def create_spark_session(config: Dict[str, Any]) -> SparkSession:
 
 def load_tables(spark: SparkSession, config: Dict[str, Any]) -> Dict[str, DataFrame]:
     """
-    Loads the requested SQLite tables into Spark DataFrames.
+    Loads the requested SQLite tables into Spark DataFrames via JDBC.
     """
     if spark is None:
         raise ValueError("Spark session not initialized.")
@@ -104,8 +106,8 @@ def load_tables(spark: SparkSession, config: Dict[str, Any]) -> Dict[str, DataFr
     config["db_path"] = db_path
     print(f"  Loading tables from SQLite DB at {db_path}")
 
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
+    jdbc_url = f"jdbc:sqlite:{db_path}"
+    fetch_size = int(config.get("jdbc_fetchsize", 10_000))
 
     table_limits = {**DEFAULT_TABLE_LIMITS, **config.get("table_limits", {})}
     tables_to_load: Sequence[str] = config.get("tables", list(table_limits.keys()))
@@ -114,22 +116,24 @@ def load_tables(spark: SparkSession, config: Dict[str, Any]) -> Dict[str, DataFr
     for table_name in tables_to_load:
         limit = table_limits.get(table_name)
         limit_clause = f" LIMIT {int(limit)}" if limit else ""
-        query = f"SELECT * FROM {table_name}{limit_clause}"
+        query = f"(SELECT * FROM {table_name}{limit_clause}) AS {table_name}_limited"
 
         start = time.perf_counter()
-        pdf = pd.read_sql_query(query, conn)
-        elapsed = time.perf_counter() - start
-
-        sdf = spark.createDataFrame(pdf)
+        sdf = (
+            spark.read.format("jdbc")
+            .option("url", jdbc_url)
+            .option("dbtable", query)
+            .option("driver", "org.sqlite.JDBC")
+            .option("fetchsize", fetch_size)
+            .load()
+        )
         sdf = sdf.cache()
         row_count = sdf.count()
+        elapsed = time.perf_counter() - start
 
         tables[table_name] = sdf
         print(f"  Loaded {row_count:,} rows from '{table_name}' in {elapsed:.2f}s (limit={limit})")
 
-        del pdf
-
-    conn.close()
     return tables
 
 
@@ -427,12 +431,12 @@ if __name__ == "__main__":
     size_options = {
         "tiny": {"pages": 10_000, "items": 10_000, "link_annotated_text": 5_000, "properties": 3_000},
         "small": {"pages": 50_000, "items": 50_000, "link_annotated_text": 20_000, "properties": 10_000},
-        # "medium": {"pages": 150_000, "items": 150_000, "link_annotated_text": 60_000, "properties": 25_000},
-        # "large": {"pages": 300_000, "items": 300_000, "link_annotated_text": 120_000, "properties": 60_000},
-        # "xlarge": {"pages": 600_000, "items": 600_000, "link_annotated_text": 240_000, "properties": 120_000},
-        # "xxlarge": {"pages": 1_200_000, "items": 1_200_000, "link_annotated_text": 480_000, "properties": 200_000},
-        # "mega": {"pages": 3_000_000, "items": 3_000_000, "link_annotated_text": 1_200_000, "properties": 400_000},
-        # "full": {"pages": 5_362_174, "items": 6_824_000, "link_annotated_text": 5_343_565, "properties": 6_985},
+        "medium": {"pages": 150_000, "items": 150_000, "link_annotated_text": 60_000, "properties": 25_000},
+        "large": {"pages": 300_000, "items": 300_000, "link_annotated_text": 120_000, "properties": 60_000},
+        "xlarge": {"pages": 600_000, "items": 600_000, "link_annotated_text": 240_000, "properties": 120_000},
+        "xxlarge": {"pages": 1_200_000, "items": 1_200_000, "link_annotated_text": 480_000, "properties": 200_000},
+        "mega": {"pages": 3_000_000, "items": 3_000_000, "link_annotated_text": 1_200_000, "properties": 400_000},
+        "full": {"pages": 5_362_174, "items": 6_824_000, "link_annotated_text": 5_343_565, "properties": 6_985},
     }
 
     CONFIGURATIONS: List[Dict[str, Any]] = []

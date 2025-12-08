@@ -187,6 +187,37 @@ def download_openimages_class_descriptions(
         return dest_path
     raise RuntimeError(f"Failed to download class descriptions from {url}")
 
+def download_c4_data(local_dir="data/allenai_c4", num_files=1):
+    """
+    Downloads shards of the C4 dataset (English) directly from HuggingFace source.
+    Format: c4-train.00000-of-01024.json.gz
+    """
+    os.makedirs(local_dir, exist_ok=True)
+    BASE_HF_URL = "https://huggingface.co/datasets/allenai/c4/resolve/main/en/"
+    
+    downloaded = []
+    print(f"--- Checking for C4 data in '{local_dir}' ---")
+
+    for i in range(num_files):
+        filename = f"c4-train.{i:05d}-of-01024.json.gz"
+        local_path = os.path.join(local_dir, filename)
+        downloaded.append(local_path)
+
+        if os.path.exists(local_path):
+            continue
+
+        url = f"{BASE_HF_URL}{filename}"
+        print(f"  Downloading: {filename}...")
+        try:
+            urllib.request.urlretrieve(url, local_path)
+            print(f"  Success: Downloaded {filename}")
+        except Exception as e:
+            print(f"!!! Failed to download {url}: {e}")
+            if os.path.exists(local_path): os.remove(local_path)
+            downloaded.pop()
+    
+    return sorted(downloaded)
+
 if __name__ == "__main__":
     print("--- Executing automated data download (Setup Phase) ---")
     base_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -195,9 +226,11 @@ if __name__ == "__main__":
     taxi_dir = os.path.join(base_path, "data", "nyc_taxi")
     wiki_dir = os.path.join(base_path, "data", "sqlite_datasets")
     cv_dir = os.path.join(base_path, "data", "cv_openimages")
+    c4_dir = os.path.join(base_path, "data", "allenai_c4")
 
     os.makedirs(wiki_dir, exist_ok=True)
     os.makedirs(cv_dir, exist_ok=True)
+    os.makedirs(c4_dir, exist_ok=True)
 
     ym_list = get_year_month_list(2009, 1, 2024, 12)
     
@@ -206,11 +239,12 @@ if __name__ == "__main__":
         (download_wikipedia_data, [wiki_dir]),
         (download_openimages_detection, [cv_dir]),
         (download_openimages_class_descriptions, [cv_dir]),
+        (download_c4_data, [c4_dir, 1024]),
     ]
 
-    print("\n--- Starting Parallel Downloads (Aircheck, Wikipedia, OpenImages) ---")
+    print("\n--- Starting Parallel Downloads (Aircheck, Wikipedia, OpenImages, C4) ---")
     
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         future_to_task = {
             executor.submit(func, *args): f"Downloading {func.__name__}"
             for func, args in tasks

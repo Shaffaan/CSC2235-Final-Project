@@ -222,7 +222,9 @@ if __name__ == "__main__":
         '100%': all_files,
     }
     system_size_configs = {
-        '12t_16gb': {'threads': 12, 'memory': "16GB"}
+        '12t_16gb': {'threads': 12, 'memory': "16GB"},
+        '20t_64gb': {'threads': 20, 'memory': "64GB"},
+        '40t_128gb': {'threads': 40, 'memory': "128GB"},
     }
 
     CONFIGURATIONS = []

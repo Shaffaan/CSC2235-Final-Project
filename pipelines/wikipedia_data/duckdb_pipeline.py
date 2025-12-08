@@ -15,7 +15,7 @@ from memory_profiler import memory_usage
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.append(PROJECT_ROOT)
 
-from common.download_sqllite import ensure_sqlite_dataset
+from common.download_utils import download_wikipedia_data
 
 DEFAULT_TABLE_LIMITS = {
     "pages": 150_000,
@@ -73,7 +73,7 @@ def load_tables(con: duckdb.DuckDBPyConnection, config: Dict[str, Any]) -> Dict[
     """
     dataset_root = config.get("dataset_root")
     if not dataset_root:
-        dataset_root = ensure_sqlite_dataset(os.path.join(PROJECT_ROOT, "data", "sqlite_datasets"))
+        dataset_root = download_wikipedia_data(os.path.join(PROJECT_ROOT, "data", "sqlite_datasets"))
         config["dataset_root"] = dataset_root
 
     db_path = resolve_database_path(dataset_root, config.get("db_path"))
@@ -391,7 +391,7 @@ if __name__ == "__main__":
     DATA_DOWNLOAD_ROOT = os.path.join(PROJECT_ROOT, "data", "sqlite_datasets")
     os.makedirs(DATA_DOWNLOAD_ROOT, exist_ok=True)
 
-    SQLITE_DATASET_PATH = ensure_sqlite_dataset(DATA_DOWNLOAD_ROOT)
+    SQLITE_DATASET_PATH = download_wikipedia_data(DATA_DOWNLOAD_ROOT)
 
     print("Path to SQLite DB files:", SQLITE_DATASET_PATH)
 

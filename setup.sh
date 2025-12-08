@@ -80,13 +80,13 @@ sudo -u "$USER_NAME" bash -c "
     fi
 
     echo 'Downloading Data...' | sudo tee -a /local/repository/setup.log
-    export PYTHONPATH=/local/repository
     
     export KAGGLE_CONFIG_DIR=/local/repository/.kaggle_config
     export XDG_CACHE_HOME=/local/repository/.cache
     mkdir -p /local/repository/.kaggle_config
     mkdir -p /local/repository/.cache
 
+    export PYTHONPATH=/local/repository
     python3 /local/repository/common/download_utils.py
 "
 

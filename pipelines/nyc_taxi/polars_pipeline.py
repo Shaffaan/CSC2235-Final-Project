@@ -29,18 +29,21 @@ def execute_deterministic_pipeline(config):
         'Trip_Distance': pl.Float64,
         'Payment_Type': pl.Float64,
         
-        'tpep_pickup_datetime': pl.Datetime("ns"),
-        'tpep_dropoff_datetime': pl.Datetime("ns"),
+        'tpep_pickup_datetime': pl.Datetime("us"),
+        'tpep_dropoff_datetime': pl.Datetime("us"),
         'fare_amount': pl.Float64,
         'trip_distance': pl.Float64,
         'payment_type': pl.Float64
     }
 
+    scan_options = pl.ScanCastOptions(datetime_cast="nanosecond-downcast")
+
     lf = pl.scan_parquet(
         config['data_files'], 
         missing_columns="insert", 
         extra_columns="ignore",
-        schema=schema_overrides 
+        schema=schema_overrides,
+        cast_options=scan_options
     )
     
     date_cols = {

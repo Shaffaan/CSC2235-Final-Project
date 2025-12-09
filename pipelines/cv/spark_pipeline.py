@@ -49,15 +49,61 @@ class OpenImagesConfig:
         return os.path.join(PROJECT_ROOT, "results", "local_test", "cv", "openimages_spark")
 
 
+_EFFECTIVE_SPARK_MODE = os.environ.get("SPARK_MODE", "local").strip().lower()
+
+
 def ensure_openimages_assets(config: OpenImagesConfig) -> Tuple[str, str]:
     annotations_path = download_openimages_detection(config.data_dir, config.detection_filename)
     class_map_path = download_openimages_class_descriptions(config.data_dir, config.class_filename)
     return annotations_path, class_map_path
 
 
+def _resolve_spark_mode_and_master(config: OpenImagesConfig) -> Tuple[str, str]:
+    global _EFFECTIVE_SPARK_MODE
+    requested_mode = os.environ.get("SPARK_MODE", "local").strip().lower()
+    env_master = os.environ.get("SPARK_MASTER_URL")
+    explicit_master = config.spark_master or env_master
+
+    if not explicit_master and env_master and env_master.startswith("spark://"):
+        explicit_master = env_master
+
+    resolved_mode = requested_mode
+    if resolved_mode != "distributed" and explicit_master and explicit_master.startswith("spark://"):
+        resolved_mode = "distributed"
+
+    if resolved_mode == "distributed":
+        if not explicit_master:
+            raise RuntimeError(
+                "SPARK_MODE=distributed requires a Spark master URL. "
+                "Set --spark-master or the SPARK_MASTER_URL environment variable."
+            )
+        master = explicit_master
+    else:
+        if explicit_master:
+            master = explicit_master
+        else:
+            local_threads = os.environ.get("SPARK_LOCAL_THREADS", "*")
+            master = f"local[{local_threads}]"
+        resolved_mode = "local"
+
+    _EFFECTIVE_SPARK_MODE = resolved_mode
+    return resolved_mode, master
+
+
+def _resolve_input_path(path: str) -> str:
+    """Adds a file:// prefix for local runs so Spark can read host-local files."""
+    if "://" in path:
+        return path
+    spark_mode = _EFFECTIVE_SPARK_MODE
+    abs_path = os.path.abspath(path)
+    if spark_mode == "distributed":
+        return abs_path
+    return f"file://{abs_path}"
+
+
 def create_spark_session(config: OpenImagesConfig) -> SparkSession:
-    master = config.spark_master or os.environ.get("SPARK_MASTER_URL") or "local[*]"
-    app_name = "OpenImagesSparkPipeline"
+    spark_mode, master = _resolve_spark_mode_and_master(config)
+    app_name = f"OpenImagesSparkPipeline_{spark_mode}"
 
     builder = (
         SparkSession.builder.appName(app_name)
@@ -67,6 +113,14 @@ def create_spark_session(config: OpenImagesConfig) -> SparkSession:
         .config("spark.executor.memory", config.spark_executor_memory)
         .config("spark.sql.shuffle.partitions", os.environ.get("SPARK_SHUFFLE_PARTITIONS", "200"))
     )
+
+    if spark_mode == "distributed":
+        print(f"  [Distributed] Connecting Spark session to {master}")
+        distributed_cores = os.environ.get("SPARK_DISTRIBUTED_MAX_CORES")
+        if distributed_cores:
+            builder = builder.config("spark.cores.max", distributed_cores)
+    else:
+        print(f"  [Local] Starting Spark session with master={master}")
 
     session = builder.getOrCreate()
     session.sparkContext.setLogLevel("WARN")
@@ -78,7 +132,7 @@ def load_detections(spark: SparkSession, csv_path: str, limit: Optional[int]) ->
     df = (
         spark.read.option("header", True)
         .option("inferSchema", True)
-        .csv(csv_path)
+        .csv(_resolve_input_path(csv_path))
     )
     if limit is not None:
         df = df.limit(int(limit))
@@ -91,7 +145,7 @@ def load_class_descriptions(spark: SparkSession, csv_path: str) -> Tuple[DataFra
     df = (
         spark.read.option("header", True)
         .option("inferSchema", True)
-        .csv(csv_path)
+        .csv(_resolve_input_path(csv_path))
     )
     if not {"LabelName", "DisplayName"}.issubset(df.columns):
         raise KeyError("Expected columns 'LabelName' and 'DisplayName' in class descriptions")

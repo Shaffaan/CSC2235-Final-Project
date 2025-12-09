@@ -4,11 +4,12 @@ import sys
 import time
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 import psutil
 from memory_profiler import memory_usage
+from pyspark import StorageLevel
 from pyspark.sql import DataFrame, SparkSession
 import pyspark.sql.functions as F
 
@@ -24,6 +25,16 @@ DEFAULT_TABLE_LIMITS = {
     "properties": 50_000,
 }
 DEFAULT_JOIN_TYPES = ["inner", "left", "right", "outer"]
+DEFAULT_STORAGE_LEVEL_NAME = "MEMORY_AND_DISK"
+_STORAGE_LEVEL_CANDIDATES: Dict[str, List[str]] = {
+    "MEMORY_ONLY": ["MEMORY_ONLY"],
+    "MEMORY_ONLY_SER": ["MEMORY_ONLY_SER", "MEMORY_ONLY"],
+    "MEMORY_AND_DISK": ["MEMORY_AND_DISK", "MEMORY_ONLY"],
+    "MEMORY_AND_DISK_SER": ["MEMORY_AND_DISK_SER", "MEMORY_AND_DISK", "MEMORY_ONLY"],
+    "DISK_ONLY": ["DISK_ONLY"],
+    "OFF_HEAP": ["OFF_HEAP", "MEMORY_ONLY"],
+    "NONE": ["NONE"],
+}
 
 
 @dataclass
@@ -37,6 +48,48 @@ class JoinPlan:
     left_on: str
     right_on: str
     suffixes: Tuple[str, str]
+
+
+def _resolve_storage_level(level_name: Optional[str]) -> Optional[StorageLevel]:
+    def _pick_level(candidates: List[str]) -> Optional[StorageLevel]:
+        for candidate in candidates:
+            if candidate == "NONE":
+                return None
+            level = getattr(StorageLevel, candidate, None)
+            if level is not None:
+                return level
+        return None
+
+    normalized = DEFAULT_STORAGE_LEVEL_NAME if not level_name else str(level_name).strip().upper()
+    candidates = _STORAGE_LEVEL_CANDIDATES.get(normalized, [normalized])
+    resolved = _pick_level(candidates)
+    if resolved is not None or normalized == "NONE":
+        return resolved
+
+    fallback = _pick_level(_STORAGE_LEVEL_CANDIDATES.get(DEFAULT_STORAGE_LEVEL_NAME, []))
+    return fallback
+
+
+def _safe_unpersist(df: Optional[DataFrame]) -> None:
+    if df is None:
+        return
+    try:
+        if df.is_cached:
+            df.unpersist()
+    except Exception:
+        pass
+
+
+def _release_cached_frames(frames: Sequence[Optional[DataFrame]]) -> None:
+    seen: Set[int] = set()
+    for frame in frames:
+        if frame is None:
+            continue
+        frame_id = id(frame)
+        if frame_id in seen:
+            continue
+        seen.add(frame_id)
+        _safe_unpersist(frame)
 
 
 def resolve_database_path(dataset_root: str, explicit_path: Optional[str] = None) -> str:
@@ -64,20 +117,25 @@ def create_spark_session(config: Dict[str, Any]) -> SparkSession:
     spark_mode = os.environ.get("SPARK_MODE", "local")
     master_url = os.environ.get("SPARK_MASTER_URL")
     threads = config.get("num_threads", "*")
-    exec_mem = config.get("memory_limit", "8g")
+    base_mem = config.get("memory_limit", "16g")
+    driver_mem = config.get("driver_memory", base_mem)
+    executor_mem = config.get("executor_memory", base_mem)
+    executor_overhead = config.get("executor_memory_overhead")
 
     builder = SparkSession.builder.appName(f"Wikipedia_Benchmark_{spark_mode}")
 
     if spark_mode == "distributed" and master_url:
         print(f"  [Distributed] Connecting Spark session to {master_url}")
         builder = builder.master(master_url)
-        builder = builder.config("spark.executor.memory", exec_mem)
-        builder = builder.config("spark.driver.memory", "4g")
+        builder = builder.config("spark.executor.memory", executor_mem)
+        if executor_overhead:
+            builder = builder.config("spark.executor.memoryOverhead", executor_overhead)
+        builder = builder.config("spark.driver.memory", driver_mem)
         builder = builder.config("spark.cores.max", int(config.get("num_threads", 12)) * 5)
     else:
         print(f"  [Local] Starting Spark session with local[{threads}]")
         builder = builder.master(f"local[{threads}]")
-        builder = builder.config("spark.driver.memory", exec_mem)
+        builder = builder.config("spark.driver.memory", driver_mem)
 
     jdbc_packages = config.get("spark_jars_packages", "org.xerial:sqlite-jdbc:3.45.1.0")
 
@@ -111,6 +169,7 @@ def load_tables(spark: SparkSession, config: Dict[str, Any]) -> Dict[str, DataFr
 
     table_limits = {**DEFAULT_TABLE_LIMITS, **config.get("table_limits", {})}
     tables_to_load: Sequence[str] = config.get("tables", list(table_limits.keys()))
+    table_storage_level = _resolve_storage_level(config.get("table_storage_level"))
 
     tables: Dict[str, DataFrame] = {}
     for table_name in tables_to_load:
@@ -127,7 +186,8 @@ def load_tables(spark: SparkSession, config: Dict[str, Any]) -> Dict[str, DataFr
             .option("fetchsize", fetch_size)
             .load()
         )
-        sdf = sdf.cache()
+        if table_storage_level:
+            sdf = sdf.persist(table_storage_level)
         row_count = sdf.count()
         elapsed = time.perf_counter() - start
 
@@ -151,9 +211,19 @@ def prepare_join_data(tables: Dict[str, DataFrame], config: Dict[str, Any]) -> L
     links = tables["link_annotated_text"]
     properties = tables.get("properties")
 
-    page_dim = pages.select("page_id", "item_id", "title", "views").dropna(subset=["item_id"]).cache()
-    item_dim = items.select("item_id", "labels", "description").cache()
-    link_dim = links.select("page_id", "sections").cache()
+    dimension_storage_setting = config.get("dimension_storage_level")
+    if dimension_storage_setting is None:
+        dimension_storage_setting = config.get("table_storage_level")
+    dimension_storage_level = _resolve_storage_level(dimension_storage_setting)
+
+    page_dim = pages.select("page_id", "item_id", "title", "views").dropna(subset=["item_id"])
+    item_dim = items.select("item_id", "labels", "description")
+    link_dim = links.select("page_id", "sections")
+
+    if dimension_storage_level:
+        page_dim = page_dim.persist(dimension_storage_level)
+        item_dim = item_dim.persist(dimension_storage_level)
+        link_dim = link_dim.persist(dimension_storage_level)
 
     join_plans: List[JoinPlan] = [
         JoinPlan(
@@ -197,6 +267,7 @@ def prepare_join_data(tables: Dict[str, DataFrame], config: Dict[str, Any]) -> L
         )
 
     print(f"  Prepared {len(join_plans)} Spark join plans.")
+    _release_cached_frames(list(tables.values()))
     return join_plans
 
 
@@ -256,41 +327,47 @@ def benchmark_joins(join_plans: List[JoinPlan], config: Dict[str, Any]) -> pd.Da
     records: List[Dict[str, Any]] = []
     print(f"  Benchmarking Spark joins ({', '.join(join_types)})...")
 
-    for plan in join_plans:
-        left_rows = plan.left_df.count()
-        right_rows = plan.right_df.count()
+    try:
+        for plan in join_plans:
+            left_rows = plan.left_df.count()
+            right_rows = plan.right_df.count()
 
-        for join_type in join_types:
-            spark_join_type = spark_join_map.get(join_type)
-            if not spark_join_type:
-                print(f"    Skipping unsupported join type '{join_type}'")
-                continue
+            for join_type in join_types:
+                spark_join_type = spark_join_map.get(join_type)
+                if not spark_join_type:
+                    print(f"    Skipping unsupported join type '{join_type}'")
+                    continue
 
-            left_df, right_df = _prepare_join_inputs(plan)
-            condition = left_df[plan.left_on] == right_df[plan.right_on]
+                left_df, right_df = _prepare_join_inputs(plan)
+                condition = left_df[plan.left_on] == right_df[plan.right_on]
 
-            step_label = f"{plan.name}:{join_type}"
-            start = time.perf_counter()
-            joined = left_df.join(right_df, condition, how=spark_join_type)
-            result_rows = joined.count()
-            elapsed = time.perf_counter() - start
+                step_label = f"{plan.name}:{join_type}"
+                start = time.perf_counter()
+                joined = left_df.join(right_df, condition, how=spark_join_type)
+                result_rows = joined.count()
+                elapsed = time.perf_counter() - start
 
-            records.append(
-                {
-                    "config_name": config.get("name", "N/A"),
-                    "join_plan": plan.name,
-                    "description": plan.description,
-                    "join_type": join_type,
-                    "left_table": plan.left_label,
-                    "right_table": plan.right_label,
-                    "left_rows": int(left_rows),
-                    "right_rows": int(right_rows),
-                    "result_rows": int(result_rows),
-                    "columns_returned": int(len(joined.columns)),
-                    "execution_time_s": elapsed,
-                }
-            )
-            print(f"    {step_label:<40} rows={result_rows:,} time={elapsed:.3f}s")
+                records.append(
+                    {
+                        "config_name": config.get("name", "N/A"),
+                        "join_plan": plan.name,
+                        "description": plan.description,
+                        "join_type": join_type,
+                        "left_table": plan.left_label,
+                        "right_table": plan.right_label,
+                        "left_rows": int(left_rows),
+                        "right_rows": int(right_rows),
+                        "result_rows": int(result_rows),
+                        "columns_returned": int(len(joined.columns)),
+                        "execution_time_s": elapsed,
+                    }
+                )
+                print(f"    {step_label:<40} rows={result_rows:,} time={elapsed:.3f}s")
+    finally:
+        plan_frames: List[Optional[DataFrame]] = []
+        for plan in join_plans:
+            plan_frames.extend((plan.left_df, plan.right_df))
+        _release_cached_frames(plan_frames)
 
     return pd.DataFrame.from_records(records)
 
@@ -428,7 +505,7 @@ if __name__ == "__main__":
 
     print("Path to SQLite DB files:", SQLITE_DATASET_PATH)
 
-    size_options = {
+    size_options: Dict[str, Dict[str, int]] = {
         "tiny": {"pages": 10_000, "items": 10_000, "link_annotated_text": 5_000, "properties": 3_000},
         "small": {"pages": 50_000, "items": 50_000, "link_annotated_text": 20_000, "properties": 10_000},
         "medium": {"pages": 150_000, "items": 150_000, "link_annotated_text": 60_000, "properties": 25_000},
@@ -439,8 +516,34 @@ if __name__ == "__main__":
         "full": {"pages": 5_362_174, "items": 6_824_000, "link_annotated_text": 5_343_565, "properties": 6_985},
     }
 
+    requested_labels = list(size_options.keys())
+
+    default_memory_map = {
+        "tiny": "6g",
+        "small": "8g",
+        "medium": "16g",
+        "large": "24g",
+        "xlarge": "32g",
+        "xxlarge": "40g",
+        "mega": "48g",
+        "full": "56g",
+    }
+    table_storage_level = os.environ.get("SPARK_TABLE_STORAGE_LEVEL", DEFAULT_STORAGE_LEVEL_NAME)
+    dimension_storage_level = os.environ.get("SPARK_DIMENSION_STORAGE_LEVEL")
+
     CONFIGURATIONS: List[Dict[str, Any]] = []
-    for label, limits in size_options.items():
+    for label in requested_labels:
+        if label not in size_options:
+            raise ValueError(f"Unknown dataset size '{label}'. Choose from: {', '.join(sorted(size_options.keys()))}.")
+        limits = size_options[label]
+        memory_limit = os.environ.get("SPARK_MEMORY_LIMIT", default_memory_map.get(label, "16g"))
+        executor_overhead = os.environ.get("SPARK_EXECUTOR_OVERHEAD")
+        if not executor_overhead:
+            if label in {"large", "xlarge", "xxlarge"}:
+                executor_overhead = "4g"
+            elif label in {"mega", "full"}:
+                executor_overhead = "8g"
+
         CONFIGURATIONS.append(
             {
                 "name": f"Wikipedia_Spark_{label}",
@@ -449,7 +552,10 @@ if __name__ == "__main__":
                 "table_limits": limits,
                 "join_types": DEFAULT_JOIN_TYPES,
                 "num_threads": psutil.cpu_count(logical=True) or "*",
-                "memory_limit": "8g",
+                "memory_limit": memory_limit,
+                "executor_memory_overhead": executor_overhead,
+                "table_storage_level": table_storage_level,
+                "dimension_storage_level": dimension_storage_level,
             }
         )
 
